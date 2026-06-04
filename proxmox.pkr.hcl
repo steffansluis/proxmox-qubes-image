@@ -80,18 +80,21 @@ source "qemu" "proxmox" {
   # answer.toml), so we wait on the QEMU process exiting rather than SSH.
   communicator = "none"
 
-  # Expose a QMP control socket so CI can periodically `screendump` the headless
-  # console for debugging. Socket lands at <output_dir>/<vm_name>.monitor.
-  qmp_enable     = true
-  qmp_socket_path = "${var.output_dir}/proxmox-ve.monitor"
+  # NOTE: we deliberately do NOT use qmp_enable here. A QMP socket is
+  # single-client; if Packer owns it our screenshot loop can't connect. Instead
+  # we add a SECOND, independent QMP socket via qemuargs below that only the
+  # screenshot loop uses. QEMU happily serves multiple monitor instances.
 
   # Generous: a TCG (no-KVM) install can take 45-60 min. Shutdown is the
   # answer-file power-off; Packer detects the QEMU exit.
   shutdown_timeout = "90m"
 
   # Serial console aids debugging headless installs in CI logs.
+  # Second QMP socket (-qmp) is exclusively for the screenshot loop, so it
+  # never contends with Packer's own VM control channel.
   qemuargs = [
     ["-serial", "stdio"],
+    ["-qmp", "unix:${var.output_dir}/screenshot.qmp,server,nowait"],
   ]
 }
 

@@ -92,7 +92,7 @@ jobs:
       - name: Start screenshot capture
         run: |
           mkdir -p screenshots
-          SOCK="output-proxmox/proxmox-ve.monitor"
+          SOCK="output-proxmox/screenshot.qmp"
           nohup bash -c '
             n=0
             # Wait up to 5 min for the socket to appear, then capture every 30s.
