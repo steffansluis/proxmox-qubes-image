@@ -85,6 +85,29 @@ jobs:
             --output prepared.iso
           ls -lh prepared.iso
 
+      # Background screenshot capture: once Packer creates the QMP socket, grab
+      # a timestamped PNG of the headless console every 30s. Uploaded as an
+      # artifact (if:always) so a hung/failed build is visually diagnosable --
+      # the only window into a communicator="none" install.
+      - name: Start screenshot capture
+        run: |
+          mkdir -p screenshots
+          SOCK="output-proxmox/proxmox-ve.monitor"
+          nohup bash -c '
+            n=0
+            # Wait up to 5 min for the socket to appear, then capture every 30s.
+            for _ in $(seq 1 600); do [ -S "'"$SOCK"'" ] && break; sleep 0.5; done
+            while [ -S "'"$SOCK"'" ]; do
+              ts=$(date -u +%H%M%S)
+              printf -v idx "%04d" "$n"
+              python3 scripts/qmp_screendump.py "'"$SOCK"'" \
+                "screenshots/frame-${idx}-${ts}.png" 2>>screenshots/capture.log || true
+              n=$((n+1))
+              sleep 30
+            done
+          ' >/dev/null 2>&1 &
+          echo "capture loop started (pid $!)"
+
       - name: Build qcow2 with Packer
         run: |
           packer init proxmox.pkr.hcl
@@ -93,6 +116,15 @@ jobs:
             -var "iso_checksum=none" \
             -var "accelerator=${{ steps.kvm.outputs.accel }}" \
             proxmox.pkr.hcl
+
+      - name: Upload console screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-screenshots
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Compress image
         run: |

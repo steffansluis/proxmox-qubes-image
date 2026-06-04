@@ -80,6 +80,11 @@ source "qemu" "proxmox" {
   # answer.toml), so we wait on the QEMU process exiting rather than SSH.
   communicator = "none"
 
+  # Expose a QMP control socket so CI can periodically `screendump` the headless
+  # console for debugging. Socket lands at <output_dir>/<vm_name>.monitor.
+  qmp_enable     = true
+  qmp_socket_path = "${var.output_dir}/proxmox-ve.monitor"
+
   # Generous: a TCG (no-KVM) install can take 45-60 min. Shutdown is the
   # answer-file power-off; Packer detects the QEMU exit.
   shutdown_timeout = "90m"

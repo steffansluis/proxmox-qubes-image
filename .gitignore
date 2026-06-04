@@ -1,5 +1,6 @@
 # Build artifacts
 output-proxmox/
+screenshots/
 *.iso
 *.qcow2
 *.qcow2.zst
