@@ -36,6 +36,9 @@ source = "from-dhcp"
 
 [disk-setup]
 filesystem = "ext4"
-# Single virtual disk in the build VM. The Qubes import re-homes root onto the
-# qube's own volume, so this just needs to be the whole build disk.
-disk-list = ["sda"]
+# The build VM uses Packer's virtio disk interface, so the single disk appears
+# as /dev/vda (NOT sda). The installer's disk filter matched nothing with
+# "sda" and aborted ~90s in with "disk in 'disk-selection' not found". The
+# Qubes import re-homes root onto the qube's own volume, so this just needs to
+# be the whole build disk.
+disk-list = ["vda"]
