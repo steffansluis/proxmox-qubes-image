@@ -21,7 +21,11 @@ root-password-hashed = "$6$8VPkmG3Y6Q3pZ9aF$ELiMy1cPYFLVd2BHH0egy6pWbeTm11sKZ/Lz
 # root-ssh-keys = ["ssh-ed25519 AAAA... you@host"]
 
 # Reboot behaviour: power off on success so the CI/QEMU process exits cleanly
-# and Packer can collect the disk. (Hetzner/QEMU pattern.)
+# and Packer can collect the disk. WITHOUT reboot-mode the installer defaults
+# to "reboot", which (with communicator="none") leaves Packer waiting at
+# "Waiting for shutdown..." until shutdown_timeout, and may re-loop the
+# installer from the still-attached ISO. (Hetzner/QEMU pattern.)
+reboot-mode = "power-off"
 reboot-on-error = false
 
 [network]
