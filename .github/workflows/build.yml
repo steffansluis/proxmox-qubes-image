@@ -147,7 +147,9 @@ jobs:
         run: |
           cd output-proxmox
           TAG="${PVE_VERSION}"
-          oras push "${IMAGE}:${TAG}" "${IMAGE}:latest" \
+          # oras push takes ONE ref then files; multiple tags go comma-separated
+          # in the ref (repo:tag1,tag2), else extra refs are read as filenames.
+          oras push "${IMAGE}:${TAG},latest" \
             --artifact-type application/vnd.proxmox.disk.image.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --annotation "org.opencontainers.image.description=Proxmox VE ${PVE_VERSION} qcow2 for Qubes HVM (unofficial community build)" \
