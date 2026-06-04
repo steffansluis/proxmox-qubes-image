@@ -1,0 +1,135 @@
+name: Build Proxmox qcow2
+
+# Builds a bare Proxmox VE qcow2 (for use as a Qubes HVM guest) and publishes
+# it to GHCR as an OCI artifact via ORAS. Triggered manually or on version tags.
+on:
+  workflow_dispatch:
+    inputs:
+      pve_version:
+        description: "Proxmox VE ISO version (e.g. 9.2-1)"
+        required: true
+        default: "9.2-1"
+  push:
+    tags:
+      - "v*"
+
+env:
+  PVE_VERSION: ${{ github.event.inputs.pve_version || '9.2-1' }}
+  IMAGE: ghcr.io/${{ github.repository }}/proxmox-ve
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      # /dev/kvm makes the install ~5x faster but isn't guaranteed on hosted
+      # runners. Enable it if present; the Packer build falls back to TCG
+      # (accelerator=none) otherwise so the job never hard-depends on it.
+      - name: Enable KVM if available
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            echo "accel=kvm" >> "$GITHUB_OUTPUT"
+            echo "KVM available -> hardware acceleration"
+          else
+            echo "accel=none" >> "$GITHUB_OUTPUT"
+            echo "No /dev/kvm -> TCG software emulation (slow)"
+          fi
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          # qemu-utils: qemu-img. xorriso/curl: ISO handling.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils xorriso curl zstd ca-certificates
+
+      - name: Install proxmox-auto-install-assistant
+        run: |
+          # Shipped from the Proxmox no-subscription repo. Add it, then install.
+          curl -fsSL https://download.proxmox.com/debian/proxmox-release-trixie.gpg \
+            | sudo tee /usr/share/keyrings/proxmox-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/proxmox-archive-keyring.gpg] \
+            http://download.proxmox.com/debian/pve trixie pve-no-subscription" \
+            | sudo tee /etc/apt/sources.list.d/pve.list
+          sudo apt-get update
+          sudo apt-get install -y proxmox-auto-install-assistant
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: "latest"
+
+      - name: Download Proxmox ISO
+        run: |
+          curl -fSL --retry 3 \
+            "https://enterprise.proxmox.com/iso/proxmox-ve_${PVE_VERSION}.iso" \
+            -o proxmox.iso
+          ls -lh proxmox.iso
+
+      - name: Validate answer file & embed into ISO
+        run: |
+          proxmox-auto-install-assistant validate-answer answer.toml
+          proxmox-auto-install-assistant prepare-iso proxmox.iso \
+            --fetch-from iso \
+            --answer-file answer.toml \
+            --output prepared.iso
+          ls -lh prepared.iso
+
+      - name: Build qcow2 with Packer
+        run: |
+          packer init proxmox.pkr.hcl
+          packer build \
+            -var "iso_path=${PWD}/prepared.iso" \
+            -var "iso_checksum=none" \
+            -var "accelerator=${{ steps.kvm.outputs.accel }}" \
+            proxmox.pkr.hcl
+
+      - name: Compress image
+        run: |
+          cd output-proxmox
+          zstd -19 -T0 --long=27 proxmox-ve.qcow2 -o proxmox-ve.qcow2.zst
+          sha256sum proxmox-ve.qcow2.zst | tee proxmox-ve.qcow2.zst.sha256
+          ls -lh
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@v1
+        with:
+          version: "1.2.0"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push artifact to GHCR
+        run: |
+          cd output-proxmox
+          TAG="${PVE_VERSION}"
+          oras push "${IMAGE}:${TAG}" "${IMAGE}:latest" \
+            --artifact-type application/vnd.proxmox.disk.image.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.description=Proxmox VE ${PVE_VERSION} qcow2 for Qubes HVM (unofficial community build)" \
+            --annotation "dev.qubes.import=qemu-img convert -O raw then qvm-volume import" \
+            proxmox-ve.qcow2.zst:application/zstd \
+            proxmox-ve.qcow2.zst.sha256:text/plain
+
+      - name: Summary
+        run: |
+          {
+            echo "## Built Proxmox VE ${PVE_VERSION}"
+            echo "- Accelerator: \`${{ steps.kvm.outputs.accel }}\`"
+            echo "- Pushed: \`${IMAGE}:${PVE_VERSION}\` and \`:latest\`"
+            echo ""
+            echo "Pull with:"
+            echo '```'
+            echo "oras pull ${IMAGE}:${PVE_VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

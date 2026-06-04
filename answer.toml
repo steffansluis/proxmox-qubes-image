@@ -1,0 +1,37 @@
+# Proxmox VE unattended-install answer file.
+# Consumed by `proxmox-auto-install-assistant prepare-iso` (PVE 8.2+).
+# Schema: https://pve.proxmox.com/wiki/Automated_Installation
+#
+# This image is built for use as a *bare HVM guest under Qubes OS* (no nested
+# KVM). Networking is intentionally DHCP here so the image is host-agnostic;
+# under Qubes you override the IP to the qube's Qubes-assigned address after
+# import (see README "Networking"). The build runner uses DHCP from QEMU's
+# user-net, which this satisfies.
+
+[global]
+keyboard = "en-us"
+country = "us"
+fqdn = "proxmox.local"
+mailto = "root@proxmox.local"
+timezone = "UTC"
+# Default password is "proxmox" -- CHANGE on first login, or override the
+# hash at build time (see scripts/gen-answer.sh). Hash is for "proxmox".
+root-password-hashed = "$6$8VPkmG3Y6Q3pZ9aF$ELiMy1cPYFLVd2BHH0egy6pWbeTm11sKZ/LzNztZ9nLBxw/jW39xcHIwhxfzOzMM/0p.s6HUegEVRnvteA/pl0"
+# Optional: inject an SSH key at build time instead of relying on the password.
+# root-ssh-keys = ["ssh-ed25519 AAAA... you@host"]
+
+# Reboot behaviour: power off on success so the CI/QEMU process exits cleanly
+# and Packer can collect the disk. (Hetzner/QEMU pattern.)
+reboot-on-error = false
+
+[network]
+# from-dhcp: installer uses the active NIC + DHCP lease, then writes a static
+# config from it. Correct for both the CI QEMU build and a first boot before
+# you pin the Qubes IP.
+source = "from-dhcp"
+
+[disk-setup]
+filesystem = "ext4"
+# Single virtual disk in the build VM. The Qubes import re-homes root onto the
+# qube's own volume, so this just needs to be the whole build disk.
+disk-list = ["sda"]

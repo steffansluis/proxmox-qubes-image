@@ -1,0 +1,13 @@
+# Build artifacts
+output-proxmox/
+*.iso
+*.qcow2
+*.qcow2.zst
+*.raw
+*.sha256
+prepared.iso
+
+# Packer
+.packer.d/
+crash.log
+*.pkr.json
