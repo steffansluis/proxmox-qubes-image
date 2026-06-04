@@ -54,7 +54,9 @@ jobs:
       - name: Install proxmox-auto-install-assistant
         run: |
           # Shipped from the Proxmox no-subscription repo. Add it, then install.
-          curl -fsSL https://download.proxmox.com/debian/proxmox-release-trixie.gpg \
+          # Fetch the key from enterprise.proxmox.com -- download.proxmox.com
+          # serves a cert with a mismatched SAN (HTTPS fails there).
+          curl -fsSL https://enterprise.proxmox.com/debian/proxmox-release-trixie.gpg \
             | sudo tee /usr/share/keyrings/proxmox-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/proxmox-archive-keyring.gpg] \
             http://download.proxmox.com/debian/pve trixie pve-no-subscription" \
