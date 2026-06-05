@@ -24,7 +24,16 @@
 set -euo pipefail
 
 MARKER=/var/lib/qubes-provision.done
-KEY_URL="https://keys.qubes-os.org/keys/qubes-release-4.3-signing-key.asc"
+# Two distinct Qubes keys, do not confuse them (this bit us once):
+#   * MASTER release key (F3FA...7F3FADA4) signs the package-signing keys; it is
+#     what keys.qubes-os.org/.../qubes-release-4.3-signing-key.asc serves.
+#   * DEBIAN packages key (1B49...0AB8C804) is what actually signs the apt repo
+#     metadata (InRelease). apt needs the DEBIAN key, NOT the master key -- the
+#     earlier failure ("Missing key 1B49...") was from installing the master key.
+# The Debian key lives in qubes-secpack (not on keys.qubes-os.org). We pin it by
+# fingerprint so a tampered URL can't slip a rogue key past us.
+DEB_KEY_URL="https://raw.githubusercontent.com/QubesOS/qubes-secpack/master/keys/template-keys/qubes-release-4.3-debian.asc"
+DEB_FPR="1B496066C096FE93D4CF0A6E720415900AB8C804"
 KEYRING=/etc/apt/keyrings/qubes-release-4.3.gpg
 LIST=/etc/apt/sources.list.d/qubes-r4.3-vm.list
 
@@ -35,17 +44,27 @@ fail() { printf '\nPROVISION FAIL: %s\n' "$*" >&2; exit 1; }
 # publishes a matching suite, so derive it rather than hard-coding.
 CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-trixie}")"
 
-# --- 0. Switch APT off the enterprise repo (else apt-get update 401s) -------
-# The stock install enables pve-enterprise + ceph-enterprise, which return 401
-# without a subscription and make `apt-get update` exit non-zero -- that would
-# abort this script before it starts. Swap to the no-subscription repo, which
-# is also the community homelab default (part of "best practices"). PVE 9 /
-# Debian 13 uses the deb822 .sources format.
-say "0/5 switch to Proxmox no-subscription repo"
-rm -f /etc/apt/sources.list.d/pve-enterprise.list \
-      /etc/apt/sources.list.d/pve-enterprise.sources \
-      /etc/apt/sources.list.d/ceph.list \
-      /etc/apt/sources.list.d/ceph-enterprise.sources 2>/dev/null || true
+# --- 0. Switch APT off the enterprise repos (else apt-get update 401s) -------
+# The stock install enables BOTH pve-enterprise and ceph-*-enterprise, which
+# 401 without a subscription and make `apt-get update` exit non-zero -- that
+# would abort this script before it starts. The exact filenames vary by PVE
+# point release (pve-enterprise.list, ceph.sources, ceph-squid trixie, ...), so
+# rather than enumerate them, disable EVERY apt source that points at
+# enterprise.proxmox.com. Then add the no-subscription repo -- the community
+# homelab default (part of "best practices"). PVE 9 uses deb822 .sources.
+say "0/5 switch to Proxmox no-subscription repos"
+# Rename any apt source file referencing the enterprise host to *.disabled (apt
+# ignores files not ending in .list/.sources). Iterate the .list/.sources files
+# directly -- /etc/apt filenames never contain spaces, so a simple loop is safe
+# and avoids the enterprise repos' 401 that would abort `apt-get update`.
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+         /etc/apt/sources.list.d/*.sources; do
+  [ -f "$f" ] || continue
+  if grep -q 'enterprise\.proxmox\.com' "$f"; then
+    mv -f "$f" "$f.disabled"
+    echo "disabled enterprise source: $f"
+  fi
+done
 cat >/etc/apt/sources.list.d/pve-no-subscription.sources <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
@@ -64,10 +83,24 @@ fi
 # --- 1. Qubes R4.3 VM apt repository ---------------------------------------
 say "1/5 add Qubes R4.3 VM repository (${CODENAME})"
 install -d -m 0755 /etc/apt/keyrings
-# Fetch + dearmor the real signing key. We pin to THIS fetched key via signed-by
-# rather than trusting a hard-coded fingerprint (the key is not on keyservers).
-curl -fsSL "${KEY_URL}" | gpg --dearmor >"${KEYRING}" \
-  || fail "could not fetch/dearmor Qubes signing key from ${KEY_URL}"
+GNUPGHOME="$(mktemp -d)"; export GNUPGHOME
+
+# Fetch the Debian packages key and PIN it by fingerprint: import it into a
+# throwaway keyring, then require that the pinned fingerprint is present. If a
+# tampered URL served any other key, ${DEB_FPR} won't be there and we abort --
+# this is the real trust anchor (the fingerprint is hard-coded above).
+curl -fsSL "${DEB_KEY_URL}" -o "${GNUPGHOME}/deb.asc" \
+  || { rm -rf "${GNUPGHOME}"; fail "could not fetch Debian packages key from ${DEB_KEY_URL}"; }
+gpg --import "${GNUPGHOME}/deb.asc" 2>/dev/null \
+  || { rm -rf "${GNUPGHOME}"; fail "could not import Debian packages key"; }
+if ! gpg --fingerprint "${DEB_FPR}" >/dev/null 2>&1; then
+  rm -rf "${GNUPGHOME}"
+  fail "fetched key does not contain pinned fingerprint ${DEB_FPR} -- refusing"
+fi
+# Export the pinned key in binary form as the repo's signed-by keyring.
+gpg --export "${DEB_FPR}" >"${KEYRING}" \
+  || { rm -rf "${GNUPGHOME}"; fail "could not export pinned key to ${KEYRING}"; }
+rm -rf "${GNUPGHOME}"; unset GNUPGHOME
 cat >"${LIST}" <<EOF
 deb [arch=amd64 signed-by=${KEYRING}] https://deb.qubes-os.org/r4.3/vm ${CODENAME} main
 EOF
