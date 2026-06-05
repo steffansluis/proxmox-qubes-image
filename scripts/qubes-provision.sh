@@ -244,6 +244,27 @@ done
 # be reachable either built-in OR in the initramfs. (The previous guard checked
 # only the initramfs and false-failed on this built-in kernel.)
 say "4/6 keep initramfs able to mount the virtio root"
+# THE boot-blocker (proven by the CI serial log, not the VGA screendumps):
+# qubes-kernel-vm-support ships an initramfs-tools local-top boot script
+# `qubes_cow_setup` that runs `gptfix fix /dev/xvda` and, when that device is
+# absent, executes `die 'Fatal error reading partition table'` -- dropping to a
+# BusyBox (initramfs) shell BEFORE systemd ever starts. /dev/xvda is the Qubes
+# split-volume disk name; this image instead boots its OWN LVM root
+# (/dev/mapper/pve-root) via its own bootloader, so the Qubes COW/gptfix
+# machinery must never run -- not under QEMU and not under a real Qubes HVM
+# StandaloneVM (which boots with kernel='' off its own root, never the dom0
+# dmroot/xvda/xvdc scheme). Remove the COW boot scripts + the hook that pulls
+# gptfix/sfdisk/xen-blkfront in, so the rebuilt initramfs is clean. This is
+# orthogonal to qrexec/GUI, which are userspace vchan services.
+for f in \
+  /usr/share/initramfs-tools/scripts/local-top/qubes_cow_setup \
+  /usr/share/initramfs-tools/scripts/local-top/scrub_pages \
+  /usr/share/initramfs-tools/hooks/qubes_vm \
+  /usr/share/initramfs-tools/conf.d/qubes.conf; do
+  if [ -e "${f}" ]; then
+    rm -f "${f}" && echo "removed Qubes initramfs file ${f}"
+  fi
+done
 cat >/etc/initramfs-tools/conf.d/zz-proxmox-force-most.conf <<'EOF'
 # Baked by qubes-provision.sh. Overrides qubes.conf's MODULES=dep so a virtio
 # root stays reachable if virtio is ever a module rather than built-in. `most`
@@ -255,6 +276,15 @@ for m in virtio_pci virtio_blk virtio_scsi dm_mod dm_snapshot; do
     || echo "$m" >>/etc/initramfs-tools/modules
 done
 update-initramfs -u -k all || fail "update-initramfs failed"
+# Tripwire: the COW boot script must NOT survive into the rebuilt initramfs --
+# its presence is exactly what wedged boot to (initramfs) on every prior run.
+KVER_CHK="$(ls -1 /boot/initrd.img-* 2>/dev/null | sed 's#.*/initrd.img-##' | sort -V | tail -1)"
+if [ -n "${KVER_CHK}" ] && command -v lsinitramfs >/dev/null 2>&1; then
+  if lsinitramfs "/boot/initrd.img-${KVER_CHK}" | grep -q 'local-top/qubes_cow_setup'; then
+    fail "qubes_cow_setup still in initramfs ${KVER_CHK} -- gptfix would re-wedge boot"
+  fi
+  echo "ok: qubes_cow_setup absent from initramfs ${KVER_CHK}"
+fi
 # Hard guard: assert virtio_blk is available to the boot path -- built into the
 # kernel (CONFIG_VIRTIO_BLK=y in /boot/config-*) OR shipped in the initramfs.
 # Either satisfies a QEMU virtio root; failing BOTH means the image won't boot.

@@ -217,6 +217,18 @@ else
     || fail "virtio_blk neither built into kernel ${KVER} nor in its initramfs"
   echo "ok: virtio_blk reachable (builtin=${vblk_builtin:-0} initramfs=${vblk_initrd:-0})"
 
+  # 5e'. The Qubes COW boot script must be ABSENT from the initramfs. It runs
+  # `gptfix fix /dev/xvda` and `die`s when that device is missing, dropping to a
+  # BusyBox (initramfs) shell before systemd starts -- the real boot-blocker the
+  # serial log exposed. This image boots its own pve-root, not the Qubes dmroot/
+  # xvda COW scheme, so qubes-provision.sh strips it. Reaching this assertion at
+  # all proves it's gone (we booted past initramfs), but verify explicitly too.
+  if [ -f "${INITRD}" ] && command -v lsinitramfs >/dev/null 2>&1; then
+    lsinitramfs "${INITRD}" | grep -q 'local-top/qubes_cow_setup' \
+      && fail "qubes_cow_setup present in initramfs -- gptfix would wedge boot to (initramfs)"
+    echo "ok: qubes_cow_setup absent from initramfs (no gptfix/xvda boot wedge)"
+  fi
+
   # 5f. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it).
   DESKTOP=/usr/share/applications/proxmox-web-gui.desktop
   [ -f "${DESKTOP}" ] || fail "missing ${DESKTOP}"
