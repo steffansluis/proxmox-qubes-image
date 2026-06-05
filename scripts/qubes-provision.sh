@@ -231,6 +231,38 @@ EOF
   echo "gated ${unit} on ConditionVirtualization=xen"
 done
 
+# THE sysinit.target trigger (named by the OnFailure serial diagnostic, run
+# 27043769421): qubes-core-agent drops
+# /usr/lib/systemd/system/systemd-random-seed.service.d/30_qubes.conf which adds
+# `Before=sysinit.target` + `ExecStartPre=/usr/lib/qubes/init/qubes-random-seed
+# .sh`. That script runs `qubesdb-read -w /qubes-random-seed`; with no qubesd it
+# prints "Failed connect to local daemon" and exits 1 -> the ExecStartPre fails
+# the whole (stock) systemd-random-seed.service. A SECOND drop-in,
+# sysinit.target.d/30_qubes.conf, adds `Requires=systemd-random-seed.service`,
+# making that failure HARD -> sysinit.target fails -> the entire boot cascades
+# (no SSH). We can't ConditionVirtualization=xen the stock unit (that would
+# disable legitimate random-seed save/restore under QEMU). Instead override the
+# Qubes drop-in so its ExecStartPre is NON-FATAL (`-` prefix): under real Xen
+# qubesdb is up and it seeds normally; under QEMU it fails harmlessly and is
+# ignored, the stock ExecStart still runs, and sysinit's Requires= is satisfied.
+RSEED_DROPIN="/usr/lib/systemd/system/systemd-random-seed.service.d/30_qubes.conf"
+if [ -f "${RSEED_DROPIN}" ]; then
+  d="/etc/systemd/system/systemd-random-seed.service.d"
+  install -d -m 0755 "${d}"
+  cat >"${d}/40-qubes-seed-nonfatal.conf" <<'EOF'
+[Service]
+# Baked by qubes-provision.sh. Qubes' 30_qubes.conf adds an ExecStartPre that
+# calls qubesdb (qubes-random-seed.sh); off-Xen it exits 1 ("Failed connect to
+# local daemon") and fails this unit, which Qubes makes a hard Requires= of
+# sysinit.target -> whole boot cascades. Reset the ExecStartPre list and re-add
+# the Qubes seeding NON-FATALLY: empty assignment clears it, `-` ignores its
+# exit status. Seeds under Xen; harmless no-op under plain QEMU.
+ExecStartPre=
+ExecStartPre=-/usr/lib/qubes/init/qubes-random-seed.sh
+EOF
+  echo "made qubes-random-seed ExecStartPre non-fatal (unblocks sysinit.target off-Xen)"
+fi
+
 # --- 4. Keep the initramfs able to mount the virtio root --------------------
 # qubes-kernel-vm-support drops /usr/share/initramfs-tools/conf.d/qubes.conf
 # with `MODULES=dep` (overriding Debian's `MODULES=most`) + a hook that
