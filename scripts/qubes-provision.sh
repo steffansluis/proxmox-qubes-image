@@ -271,6 +271,59 @@ if [ -n "${KVER}" ]; then
   echo "ok: virtio_blk reachable (builtin=${builtin_ok:-0} initramfs=${initrd_ok:-0}) for ${KVER}"
 fi
 
+# --- 4b. Serial console on the kernel cmdline -------------------------------
+# Best practice for a headless server image: emit the kernel + systemd console
+# to ttyS0 so boot is observable over a serial line (and the CI smoke test can
+# capture a lossless, ordered boot log to diagnose any early-boot failure --
+# VGA screendumps only catch a frozen frame, not scrollback). Keep tty0 too so
+# the VGA console still works. Append once, idempotently, then refresh grub.
+say "4b/6 add serial console (console=ttyS0) to kernel cmdline"
+SERIAL_ARGS="console=tty0 console=ttyS0,115200"
+refreshed=""
+# Proxmox boots EITHER via systemd-boot/proxmox-boot-tool (cmdline lives in
+# /etc/kernel/cmdline) OR via classic grub (GRUB_CMDLINE_LINUX_DEFAULT in
+# /etc/default/grub). Patch whichever source the box actually uses, else the
+# edit is a silent no-op and the serial console never appears. Keep tty0 so the
+# VGA console still works for screendumps.
+
+# --- systemd-boot path (proxmox-boot-tool) ---------------------------------
+KCMDLINE=/etc/kernel/cmdline
+if command -v proxmox-boot-tool >/dev/null 2>&1 \
+   && proxmox-boot-tool status >/dev/null 2>&1; then
+  if [ -f "${KCMDLINE}" ]; then
+    if ! grep -q 'console=ttyS0' "${KCMDLINE}"; then
+      # Single-line file: append the args to the end of the (only) line.
+      sed -i "1 s|\$| ${SERIAL_ARGS}|" "${KCMDLINE}"
+    fi
+  else
+    echo "root=/dev/mapper/pve-root ro quiet ${SERIAL_ARGS}" >"${KCMDLINE}"
+  fi
+  proxmox-boot-tool refresh || fail "proxmox-boot-tool refresh failed"
+  refreshed=1
+  echo "ok: ${SERIAL_ARGS} via proxmox-boot-tool (${KCMDLINE})"
+fi
+
+# --- classic grub path ------------------------------------------------------
+GRUBDEF=/etc/default/grub
+if [ -z "${refreshed}" ] && [ -f "${GRUBDEF}" ]; then
+  if ! grep -q 'console=ttyS0' "${GRUBDEF}"; then
+    # Append to GRUB_CMDLINE_LINUX_DEFAULT, preserving any existing value.
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "${GRUBDEF}"; then
+      sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 ${SERIAL_ARGS}\"/" \
+        "${GRUBDEF}"
+    else
+      echo "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet ${SERIAL_ARGS}\"" >>"${GRUBDEF}"
+    fi
+  fi
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub || fail "update-grub failed"
+    refreshed=1
+    echo "ok: ${SERIAL_ARGS} via update-grub (${GRUBDEF})"
+  fi
+fi
+
+[ -n "${refreshed}" ] || fail "no bootloader cmdline source found -- serial console not applied"
+
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
 # Chromium --app window, which the dom0 WM decorates like any native app window.

@@ -20,6 +20,12 @@ PASSWORD="proxmox"
 QEMU_PID=""
 OVERLAY=""
 QMP_SOCK=""
+# Lossless, ORDERED boot log. The provisioned image bakes console=ttyS0,115200
+# into the kernel cmdline (qubes-provision.sh stage 4b), so every systemd job
+# result -- including the "Failed to start <unit>" line that NAMES a boot-hang
+# culprit -- lands here in order. A single VGA screendump can't show scrollback;
+# this can. CI uploads it as an artifact. Override dir via env.
+SERIAL_LOG="${SMOKE_SERIAL_LOG:-smoke-boot-serial.log}"
 # If boot hangs (e.g. baking the Qubes agents in regresses boot), we screendump
 # the guest's VGA console via QMP -- the installed system boots with `quiet` and
 # NO console=ttyS0, so serial capture would be empty, but systemd job status and
@@ -59,7 +65,7 @@ qemu-system-x86_64 \
   -drive file="${OVERLAY}",format=qcow2,if=virtio \
   -netdev user,id=n0,hostfwd=tcp::"${SSH_PORT}"-:22 \
   -device virtio-net-pci,netdev=n0 \
-  -nographic -serial null -qmp "unix:${QMP_SOCK},server,nowait" &
+  -nographic -serial "file:${SERIAL_LOG}" -qmp "unix:${QMP_SOCK},server,nowait" &
 QEMU_PID=$!
 
 # Screendump the guest's current VGA framebuffer (best-effort). Without an arg
@@ -75,6 +81,15 @@ grab_console() {
     >/dev/null 2>&1 || true
 }
 
+# Echo the tail of the ordered serial boot log to CI stdout so a boot hang's
+# real culprit is visible in the job output, not just the uploaded artifact.
+dump_serial() {
+  [ -f "${SERIAL_LOG}" ] || return 0
+  echo "----- serial boot log (last 120 lines of ${SERIAL_LOG}) -----" >&2
+  tail -n 120 "${SERIAL_LOG}" >&2 || true
+  echo "----- end serial boot log -----" >&2
+}
+
 echo "Waiting for Proxmox SSH (up to ~6 min)..."
 ready=""
 for i in $(seq 1 180); do
@@ -83,6 +98,7 @@ for i in $(seq 1 180); do
   kill -0 "${QEMU_PID}" 2>/dev/null || {
     echo "QEMU exited prematurely" >&2
     grab_console
+    dump_serial
     exit 1
   }
   # Snapshot the console periodically through the boot window so a hang's root
@@ -96,6 +112,9 @@ done
   # Final screendump of the VGA console before we tear QEMU down; CI uploads
   # ${SCREENSHOT} plus the numbered frames above as artifacts.
   grab_console
+  # The ordered serial log is the authoritative diagnosis -- echo its tail to
+  # the job output and let CI upload the full file as an artifact.
+  dump_serial
   exit 1
 }
 echo "SSH up after ~$((i*2))s."

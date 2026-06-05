@@ -171,11 +171,14 @@ jobs:
         with:
           name: smoke-log
           # Also grab the boot-console screenshots smoke-test.sh writes when the
-          # guest never reaches SSH (final + numbered mid-boot frames), so a boot
-          # hang is diagnosable from CI alone.
+          # guest never reaches SSH (final + numbered mid-boot frames), plus the
+          # ordered serial boot log (console=ttyS0 baked in) which -- unlike a
+          # single screendump -- preserves scrollback and NAMES any unit that
+          # hangs boot. A boot hang is then diagnosable from CI alone.
           path: |
             smoke.log
             smoke-boot-console*.png
+            smoke-boot-serial.log
           if-no-files-found: warn
           retention-days: 14
 
