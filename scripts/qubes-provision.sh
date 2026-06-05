@@ -16,16 +16,20 @@
 #       - Wrong-layout units -> MASK. qubes-rootfs-resize/qubes-mount-dirs/
 #         dev-xvdc1-swap wait on Qubes split-disk names (xvda/xvdb/xvdc) that
 #         never exist on this single-qcow2 image, even under Xen.
-#       - Xen-only early units -> GATE with ConditionVirtualization=xen drop-ins.
-#         qubes-sysinit.service busy-waits FOREVER on /dev/xen/xenbus and is
-#         ordered Before=sysinit.target, so with no Xen it wedges the whole boot.
-#         The gate runs it under Qubes but skips it cleanly under QEMU.
-#   * Repair the initramfs: qubes-kernel-vm-support forces MODULES=dep + only
-#     xen-blkfront, so a QEMU-virtio root can't be found. Restore MODULES=most +
-#     force virtio/dm modules and rebuild, or the image won't boot off Xen.
-#   * qrexec-agent + qubesdb are left ENABLED: they fail SOFT without a Xen
-#     backend (retry within their start timeout, never block boot) and are what
-#     light up the integration once under Qubes -- masking them would defeat it.
+#       - Xen-needing units -> GATE the WHOLE set with ConditionVirtualization
+#         =xen drop-ins (qubes-sysinit, qubes-early-vm-config, qubes-db,
+#         qubes-qrexec-agent, qubes-misc-post, qubes-meminfo-writer,
+#         qubes-updates-proxy-forwarder). qubes-sysinit busy-waits FOREVER on
+#         /dev/xen/xenbus and qubes-db (Type=notify) never signals readiness
+#         without a backend; several order Before=sysinit.target, so off-Xen they
+#         wedge or cascade-fail boot. The gate runs them all under Qubes (a domU
+#         IS a Xen guest) but skips them cleanly under QEMU. The packages stay
+#         installed and the gate self-lifts under Xen, so the integration is
+#         fully preserved -- nothing is lost by gating vs leaving enabled.
+#   * Initramfs: the Proxmox kernel builds virtio in (CONFIG_VIRTIO_BLK=y), so
+#     the virtio root is always reachable; we still restore MODULES=most (which
+#     qubes-kernel-vm-support flips to dep) as portability insurance and guard
+#     that virtio_blk is reachable built-in OR via the initramfs.
 #
 # Idempotent: safe to re-run. Writes /var/lib/qubes-provision.done on success.
 set -euo pipefail
@@ -177,15 +181,19 @@ rm -f "${LIST}" "${KEYRING}"
 #      under real Xen here. Masking is correct, not just expedient.
 #
 #   b) Units we DO want under real Xen (they power the integration) but that
-#      stall without Xen -> gate on ConditionVirtualization=xen via a drop-in,
-#      so they SKIP cleanly under QEMU yet run normally under Qubes. The critical
-#      one is qubes-sysinit.service: its helper busy-waits FOREVER on
-#      /dev/xen/xenbus and is ordered Before=sysinit.target, so with no Xen it
-#      wedges the whole boot (the 6-min CI hang). qubes-early-vm-config is the
-#      same shape. qubes-db + qubes-qrexec-agent are deliberately left ENABLED:
-#      they fail soft (local daemon / retry) within their start timeout and are
-#      what make qrexec work once under Xen -- masking them would defeat the
-#      integration this image exists to provide.
+#      stall or FAIL without Xen -> gate on ConditionVirtualization=xen via a
+#      drop-in, so they SKIP cleanly under QEMU yet run normally under Qubes (a
+#      Qubes domU IS a Xen guest, so the condition is true there). This is the
+#      right tool for the WHOLE Qubes early-boot set, not just one unit:
+#      qubes-sysinit busy-waits forever on /dev/xen/xenbus ordered
+#      Before=sysinit.target; qubes-db is Type=notify ordered Before=sysinit
+#      .target and never signals readiness without a backend (so it FAILS and
+#      cascades "Dependency failed" up through sysinit.target -> multi-user
+#      .target -> ssh, dropping boot to emergency mode -- exactly the CI hang).
+#      Gating them ALL (vs hand-picking) is both correct and robust: under QEMU
+#      none run -> clean boot; under Qubes all run -> full integration. The
+#      packages stay installed and the gate self-lifts under Xen, so nothing is
+#      lost. (qubes-gui-agent already self-skips via its own qubesdb ExecCondition.)
 say "3/6 make boot Xen-optional (mask wrong-layout units, gate Xen-only units)"
 systemctl mask qubes-rootfs-resize.service qubes-mount-dirs.service \
   || fail "could not mask wrong-layout Qubes units"
@@ -194,18 +202,33 @@ systemctl mask qubes-rootfs-resize.service qubes-mount-dirs.service \
 if systemctl cat dev-xvdc1-swap.service >/dev/null 2>&1; then
   systemctl mask dev-xvdc1-swap.service || fail "could not mask dev-xvdc1-swap"
 fi
-# Gate the Xen-only early units so they run under real Xen but skip under QEMU.
-for unit in qubes-sysinit.service qubes-early-vm-config.service; do
+# Gate every enabled Qubes early/daemon unit that needs a Xen backend. Each is
+# optional (the preset may not ship all), so only write the drop-in for units
+# that actually exist. They run under real Xen, skip cleanly under QEMU.
+GATE_UNITS=(
+  qubes-sysinit.service
+  qubes-early-vm-config.service
+  qubes-db.service
+  qubes-qrexec-agent.service
+  qubes-misc-post.service
+  qubes-meminfo-writer.service
+  qubes-updates-proxy-forwarder.service
+)
+for unit in "${GATE_UNITS[@]}"; do
+  systemctl cat "${unit}" >/dev/null 2>&1 || continue
   d="/etc/systemd/system/${unit}.d"
   install -d -m 0755 "${d}"
   cat >"${d}/10-skip-without-xen.conf" <<'EOF'
 [Unit]
 # Baked by qubes-provision.sh. This image must also boot under plain QEMU (no
-# Xen). qubes-sysinit.sh busy-waits forever on /dev/xen/xenbus and is ordered
-# Before=sysinit.target, so without Xen it stalls the entire boot. Run these
-# only under real Xen (Qubes); skip cleanly (condition-not-met) everywhere else.
+# Xen). These Qubes units stall or fail without a Xen backend (qubes-sysinit
+# busy-waits on /dev/xen/xenbus; qubes-db is Type=notify and never signals
+# ready), and several are ordered Before=sysinit.target, so without Xen they
+# wedge or cascade-fail the whole boot. Run only under real Xen (Qubes); skip
+# cleanly (condition-not-met, treated as success) everywhere else.
 ConditionVirtualization=xen
 EOF
+  echo "gated ${unit} on ConditionVirtualization=xen"
 done
 
 # --- 4. Keep the initramfs able to mount the virtio root --------------------

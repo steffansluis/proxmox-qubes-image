@@ -62,10 +62,16 @@ qemu-system-x86_64 \
   -nographic -serial null -qmp "unix:${QMP_SOCK},server,nowait" &
 QEMU_PID=$!
 
-# Screendump the guest's current VGA framebuffer to ${SCREENSHOT} (best-effort).
+# Screendump the guest's current VGA framebuffer (best-effort). Without an arg
+# it writes ${SCREENSHOT} (the canonical "boot console" artifact); with an arg
+# it writes a numbered frame so we can capture a SERIES during boot -- the
+# systemd "Failed to start <unit>" line that names the culprit prints once and
+# scrolls off, so a single end-of-timeout shot only catches the [DEPEND] cascade.
 grab_console() {
   [ -S "${QMP_SOCK}" ] || return 0
-  python3 "$(dirname "$0")/qmp_screendump.py" "${QMP_SOCK}" "${SCREENSHOT}" \
+  local out="${SCREENSHOT}"
+  [ -n "${1:-}" ] && out="${SCREENSHOT%.png}-${1}.png"
+  python3 "$(dirname "$0")/qmp_screendump.py" "${QMP_SOCK}" "${out}" \
     >/dev/null 2>&1 || true
 }
 
@@ -79,12 +85,16 @@ for i in $(seq 1 180); do
     grab_console
     exit 1
   }
+  # Snapshot the console periodically through the boot window so a hang's root
+  # cause (the unit that actually failed) is captured before it scrolls away.
+  # Frames at ~30s, 60s, 90s, 150s, 240s cover initramfs through emergency mode.
+  case "$i" in 15|30|45|75|120) grab_console "$((i*2))s" ;; esac
   sleep 2
 done
 [ -n "${ready}" ] || {
   echo "SSH never came up -- capturing boot console for diagnosis" >&2
-  # Screendump whatever is on the VGA console (initramfs shell / stuck systemd
-  # job) before we tear QEMU down; CI uploads ${SCREENSHOT} as an artifact.
+  # Final screendump of the VGA console before we tear QEMU down; CI uploads
+  # ${SCREENSHOT} plus the numbered frames above as artifacts.
   grab_console
   exit 1
 }
