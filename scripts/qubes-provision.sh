@@ -380,6 +380,36 @@ for cfg in /boot/grub/grub.cfg /boot/efi/EFI/proxmox/*/grub.cfg /etc/kernel/cmdl
 done
 echo "ok: boot config targets pve-root (no stray root=dmroot)"
 
+# --- 4c. Boot-failure diagnostic to serial (TEMPORARY instrumentation) ------
+# Boot now reaches systemd (root mounts), but sysinit.target fails and the
+# serial log only shows the [DEPEND] cascade -- it does NOT reliably reveal WHY
+# the one or two genuinely-failed units failed. Rather than guess, hook
+# sysinit.target's failure: OnFailure starts a DefaultDependencies=no oneshot
+# that dumps the authoritative failed-unit list + per-unit status + journal
+# errors to ttyS0, where the smoke test captures it. This is removable once the
+# root cause is gated/masked, but is also harmless to keep on a headless image.
+say "4c/6 install boot-failure serial diagnostic (OnFailure on sysinit.target)"
+cat >/etc/systemd/system/boot-diag.service <<'EOF'
+[Unit]
+Description=Dump failed units to serial console for boot diagnosis
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+# >/dev/ttyS0 so it lands in the smoke test's -serial file capture. `-` prefix
+# on each so one failing probe can't abort the dump.
+ExecStart=/bin/sh -c '{ echo "===== BOOT-DIAG: systemctl --failed ====="; systemctl --failed --no-pager --no-legend; echo "===== status: failing units ====="; systemctl status --no-pager --full --lines=30 rpcbind.socket systemd-random-seed.service systemd-tmpfiles-setup.service var.mount var-lib.mount 2>&1; echo "===== journal (this boot, errors) ====="; journalctl -b --no-pager -p err -o short 2>&1; echo "===== END BOOT-DIAG ====="; } >/dev/ttyS0 2>&1'
+EOF
+install -d -m 0755 /etc/systemd/system/sysinit.target.d
+cat >/etc/systemd/system/sysinit.target.d/90-boot-diag.conf <<'EOF'
+[Unit]
+# When sysinit.target fails (no Xen / a wrong-env unit), fire the serial dumper.
+OnFailure=boot-diag.service
+EOF
+echo "ok: boot-diag.service wired via OnFailure on sysinit.target"
+
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
 # Chromium --app window, which the dom0 WM decorates like any native app window.
