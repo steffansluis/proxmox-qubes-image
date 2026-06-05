@@ -127,6 +127,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Bake Qubes guest integration (qrexec + GUI agent + "Proxmox Web GUI"
+      # app-menu shortcut) INTO the image. Boots the real qcow2 read-write,
+      # installs the agents from the Qubes R4.3 VM repo, masks the two units
+      # that would block boot on a non-Qubes disk layout, then powers off so the
+      # changes persist into the published artifact. Only with KVM -- a TCG boot
+      # is too slow. The proven power-off Packer build is left untouched.
+      - name: Bake Qubes guest agents into image
+        if: steps.kvm.outputs.accel == 'kvm'
+        run: |
+          set -o pipefail
+          chmod +x scripts/provision.sh scripts/qubes-provision.sh
+          scripts/provision.sh output-proxmox/proxmox-ve.qcow2 \
+            2>&1 | tee provision.log
+
+      - name: Upload provision log
+        if: always() && steps.kvm.outputs.accel == 'kvm'
+        uses: actions/upload-artifact@v4
+        with:
+          name: provision-log
+          path: provision.log
+          if-no-files-found: warn
+          retention-days: 14
+
       # Boot the freshly built image and validate the services-domain patterns
       # (Proxmox API, vmbr1 NAT bridge, unprivileged LXC, container NAT-out)
       # BEFORE publishing -- a failed smoke gates the GHCR push so we never ship
@@ -150,6 +173,17 @@ jobs:
           path: smoke.log
           if-no-files-found: warn
           retention-days: 14
+
+      # Refuse to publish an image that wasn't provisioned + smoke-tested. Both
+      # of those stages require KVM; without it we'd otherwise ship a bare,
+      # unvalidated image that lacks the Qubes integration this repo promises.
+      - name: Require provisioned + tested image before publish
+        if: steps.kvm.outputs.accel != 'kvm'
+        run: |
+          echo "::error::No /dev/kvm on the runner -> Qubes provision + smoke" \
+               "were skipped. Refusing to publish an unintegrated, untested" \
+               "image. Re-run on a KVM-capable runner." >&2
+          exit 1
 
       - name: Compress image
         run: |
@@ -177,7 +211,7 @@ jobs:
           oras push "${IMAGE}:${TAG},latest" \
             --artifact-type application/vnd.proxmox.disk.image.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "org.opencontainers.image.description=Proxmox VE ${PVE_VERSION} qcow2 for Qubes HVM (unofficial community build)" \
+            --annotation "org.opencontainers.image.description=Proxmox VE ${PVE_VERSION} qcow2 for Qubes HVM with guest agents baked in -- qrexec, GUI agent, Proxmox Web GUI app shortcut (unofficial community build)" \
             --annotation "dev.qubes.import=qemu-img convert -O raw then qvm-volume import" \
             proxmox-ve.qcow2.zst:application/zstd \
             proxmox-ve.qcow2.zst.sha256:text/plain
