@@ -101,6 +101,12 @@ fi
 gpg --export "${DEB_FPR}" >"${KEYRING}" \
   || { rm -rf "${GNUPGHOME}"; fail "could not export pinned key to ${KEYRING}"; }
 rm -rf "${GNUPGHOME}"; unset GNUPGHOME
+# This is only a BOOTSTRAP source, used to fetch qubes-core-agent. The package
+# itself ships the canonical /etc/apt/sources.list.d/qubes-r4.list +
+# /usr/share/keyrings/qubes-archive-keyring-4.3.gpg, which point at the SAME
+# repo with a different signed-by path. Leaving both in place makes apt abort
+# with "Conflicting values set for option Signed-By", so stage 2 deletes this
+# bootstrap pair right after install and lets the package's own config stand.
 cat >"${LIST}" <<EOF
 deb [arch=amd64 signed-by=${KEYRING}] https://deb.qubes-os.org/r4.3/vm ${CODENAME} main
 EOF
@@ -143,6 +149,14 @@ done
 if grep -Eq 'xvd[ab]|/dev/xvd' /etc/fstab; then
   fail "/etc/fstab contains Qubes xvd* mounts -- confold failed, boot would break"
 fi
+
+# Drop the bootstrap repo + keyring now that qubes-core-agent has shipped its
+# own canonical /etc/apt/sources.list.d/qubes-r4.list +
+# /usr/share/keyrings/qubes-archive-keyring-4.3.gpg. Both point at the SAME
+# repo but via a different signed-by path, so leaving the bootstrap pair in
+# place makes the very next apt-get abort with "Conflicting values set for
+# option Signed-By". Remove ours and let the package's own config stand.
+rm -f "${LIST}" "${KEYRING}"
 
 # --- 3. Neutralise the boot-blocking units ----------------------------------
 # These two oneshots order Before=local-fs.target and block on Xen disk names
