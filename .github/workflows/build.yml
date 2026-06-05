@@ -170,7 +170,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: smoke-log
-          path: smoke.log
+          # Also grab the boot-console screenshot smoke-test.sh writes when the
+          # guest never reaches SSH, so a boot hang is diagnosable from CI alone.
+          path: |
+            smoke.log
+            smoke-boot-console.png
           if-no-files-found: warn
           retention-days: 14
 
