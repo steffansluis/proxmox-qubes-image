@@ -108,11 +108,19 @@ EOF
 # --- 2. Install the guest agents (NO networking agent) ----------------------
 say "2/5 install qubes-core-agent + qubes-gui-agent (no networking agent)"
 export DEBIAN_FRONTEND=noninteractive
+# DEBIAN_FRONTEND=noninteractive suppresses debconf prompts but NOT dpkg's
+# conffile prompts. qubes-core-agent ships its own /etc/fstab (built for the
+# Qubes split xvda/xvdb layout), so dpkg stops to ask "keep or replace?" -- on
+# a non-interactive SSH stdin that EOFs and the install errors. We must KEEP
+# Proxmox's existing fstab (replacing it would break boot: wrong/missing
+# mounts), so force-confold keeps current files and force-confdef takes the
+# package default where there's no local edit. Applied to every apt install.
+APT_OPTS=(-o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
 apt-get update || fail "apt-get update failed (Qubes repo unreachable?)"
 # --no-install-recommends is load-bearing: it keeps qubes-core-agent-networking
 # (a Recommends of qubes-core-agent) OUT. qubes-gui-agent's hard Depends still
 # pull the Xorg server + the dummy video / qubes input drivers it needs.
-apt-get install -y --no-install-recommends \
+apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
   qubes-core-agent \
   qubes-gui-agent \
   qubes-kernel-vm-support \
@@ -121,6 +129,19 @@ apt-get install -y --no-install-recommends \
 # Guard: assert the networking agent really did NOT come in.
 if dpkg -l qubes-core-agent-networking 2>/dev/null | grep -q '^ii'; then
   fail "qubes-core-agent-networking got installed -- it will fight Proxmox vmbr0"
+fi
+
+# Guard: confirm both agents actually configured (force-confold must not have
+# left them half-installed) and Proxmox's fstab survived. qubes-core-agent ships
+# a Qubes-layout /etc/fstab; if it had replaced ours the box wouldn't boot.
+for pkg in qubes-core-agent qubes-gui-agent; do
+  dpkg -l "${pkg}" 2>/dev/null | grep -q '^ii' \
+    || fail "${pkg} did not reach 'installed' state (dpkg conffile/EOF?)"
+done
+# The Qubes fstab mounts /rw and /usr/local off xvdb; if those markers appear,
+# our fstab was clobbered by the package version and the box won't boot right.
+if grep -Eq 'xvd[ab]|/dev/xvd' /etc/fstab; then
+  fail "/etc/fstab contains Qubes xvd* mounts -- confold failed, boot would break"
 fi
 
 # --- 3. Neutralise the boot-blocking units ----------------------------------
@@ -138,7 +159,8 @@ systemctl mask qubes-rootfs-resize.service qubes-mount-dirs.service \
 say "4/5 install chromium + 'Proxmox Web GUI' .desktop"
 # desktop-file-utils provides desktop-file-validate, which both this script and
 # the smoke test's stage 5 rely on; it isn't guaranteed on a minimal PVE install.
-apt-get install -y --no-install-recommends chromium desktop-file-utils \
+apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
+  chromium desktop-file-utils \
   || fail "chromium / desktop-file-utils install failed"
 
 # Resolve the chromium binary name across Debian variants (chromium vs
@@ -161,7 +183,7 @@ Comment=Open the Proxmox VE web interface
 Exec=${CHROMIUM_BIN} --app=https://localhost:8006 --ignore-certificate-errors
 Icon=proxmox-ve
 Terminal=false
-Categories=System;Network;
+Categories=Network;
 StartupNotify=true
 EOF
 desktop-file-validate /usr/share/applications/proxmox-web-gui.desktop \
