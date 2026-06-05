@@ -208,23 +208,23 @@ ConditionVirtualization=xen
 EOF
 done
 
-# --- 4. Repair the initramfs so it can mount the virtio root ----------------
+# --- 4. Keep the initramfs able to mount the virtio root --------------------
 # qubes-kernel-vm-support drops /usr/share/initramfs-tools/conf.d/qubes.conf
-# with `MODULES=dep` (overriding Debian's `MODULES=most`) and an initramfs hook
-# that force-loads xen-blkfront but NO virtio driver, then its postinst rebuilt
-# /boot/initrd.img. Under plain QEMU the disk is virtio, so a `dep` initramfs
-# omits virtio_blk/virtio_pci, the kernel never sees the disk, /dev/mapper/
-# pve-root never appears, and boot drops to the initramfs emergency shell (the
-# silent hang under `quiet`). Real Xen would be fine, but this image must boot
-# both ways. Restore `MODULES=most` via a higher-priority conf (conf.d is read
-# in sorted order, last wins) AND belt-and-suspenders force the virtio + dm
-# modules in, then rebuild every installed kernel's initramfs.
-say "4/6 repair initramfs (keep virtio/dm so the LVM root mounts off Xen)"
+# with `MODULES=dep` (overriding Debian's `MODULES=most`) + a hook that
+# force-loads xen-blkfront but NO virtio. On a kernel where virtio is a MODULE
+# that would strip virtio_blk from the initramfs and a QEMU virtio root would be
+# unfindable. The Proxmox kernel actually builds virtio in (CONFIG_VIRTIO_BLK=y,
+# CONFIG_VIRTIO_PCI=y, CONFIG_BLK_DEV_DM=y), so it's always present regardless of
+# the initramfs -- which is why the bare image always booted under QEMU. We still
+# restore `MODULES=most` (cheap, portable insurance via a higher-priority conf.d
+# file -- last sorted wins) and rebuild, but the real GUARD is: virtio_blk must
+# be reachable either built-in OR in the initramfs. (The previous guard checked
+# only the initramfs and false-failed on this built-in kernel.)
+say "4/6 keep initramfs able to mount the virtio root"
 cat >/etc/initramfs-tools/conf.d/zz-proxmox-force-most.conf <<'EOF'
-# Baked by qubes-provision.sh. Overrides qubes.conf's MODULES=dep: this image
-# also boots under plain QEMU (virtio disk), where a `dep` initramfs would lack
-# virtio_blk and fail to find the LVM root. `most` bundles the common storage
-# drivers (incl. virtio) like a stock Debian initramfs.
+# Baked by qubes-provision.sh. Overrides qubes.conf's MODULES=dep so a virtio
+# root stays reachable if virtio is ever a module rather than built-in. `most`
+# bundles the common storage drivers like a stock Debian initramfs.
 MODULES=most
 EOF
 for m in virtio_pci virtio_blk virtio_scsi dm_mod dm_snapshot; do
@@ -232,13 +232,20 @@ for m in virtio_pci virtio_blk virtio_scsi dm_mod dm_snapshot; do
     || echo "$m" >>/etc/initramfs-tools/modules
 done
 update-initramfs -u -k all || fail "update-initramfs failed"
-# Verify the just-built initramfs really carries virtio-blk -- if this regresses
-# the image won't boot off Xen, so make it a hard, fail-fast guard.
+# Hard guard: assert virtio_blk is available to the boot path -- built into the
+# kernel (CONFIG_VIRTIO_BLK=y in /boot/config-*) OR shipped in the initramfs.
+# Either satisfies a QEMU virtio root; failing BOTH means the image won't boot.
 KVER="$(ls -1 /boot/initrd.img-* 2>/dev/null | sed 's#.*/initrd.img-##' | sort -V | tail -1)"
-if [ -n "${KVER}" ] && command -v lsinitramfs >/dev/null 2>&1; then
-  lsinitramfs "/boot/initrd.img-${KVER}" | grep -q 'virtio_blk' \
-    || fail "rebuilt initramfs (${KVER}) lacks virtio_blk -- would not boot on QEMU"
-  echo "ok: initramfs ${KVER} contains virtio_blk"
+if [ -n "${KVER}" ]; then
+  builtin_ok=""; initrd_ok=""
+  [ -f "/boot/config-${KVER}" ] && grep -q '^CONFIG_VIRTIO_BLK=y' "/boot/config-${KVER}" \
+    && builtin_ok=1
+  if command -v lsinitramfs >/dev/null 2>&1; then
+    lsinitramfs "/boot/initrd.img-${KVER}" | grep -q 'virtio_blk' && initrd_ok=1
+  fi
+  [ -n "${builtin_ok}" ] || [ -n "${initrd_ok}" ] \
+    || fail "virtio_blk neither built into kernel ${KVER} nor in its initramfs -- would not boot on QEMU"
+  echo "ok: virtio_blk reachable (builtin=${builtin_ok:-0} initramfs=${initrd_ok:-0}) for ${KVER}"
 fi
 
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------

@@ -201,16 +201,21 @@ else
   done
   echo "ok: qubes-sysinit + early-vm-config gated to Xen (skipped here)"
 
-  # 5e. The initramfs must carry virtio_blk or the LVM root won't mount under
-  # QEMU. qubes-kernel-vm-support's MODULES=dep would have dropped it; the
-  # provision step restores MODULES=most + force-includes virtio. This running
-  # system booted off that initramfs, but assert it explicitly for clarity.
-  INITRD="$(ls -1 /boot/initrd.img-* 2>/dev/null | sort -V | tail -1)"
-  if [ -n "${INITRD}" ] && command -v lsinitramfs >/dev/null 2>&1; then
-    lsinitramfs "${INITRD}" | grep -q 'virtio_blk' \
-      || fail "initramfs ${INITRD} lacks virtio_blk -- would not boot under QEMU"
-    echo "ok: initramfs $(basename "${INITRD}") contains virtio_blk"
+  # 5e. virtio_blk must be reachable for the QEMU virtio root -- built into the
+  # Proxmox kernel (CONFIG_VIRTIO_BLK=y) OR in the initramfs. The PVE kernel
+  # builds it in, so it won't show in lsinitramfs; accept either. (We're running
+  # off virtio right now, so this is really a regression tripwire.)
+  KVER="$(uname -r)"
+  vblk_builtin=""; vblk_initrd=""
+  [ -f "/boot/config-${KVER}" ] && grep -q '^CONFIG_VIRTIO_BLK=y' "/boot/config-${KVER}" \
+    && vblk_builtin=1
+  INITRD="/boot/initrd.img-${KVER}"
+  if [ -f "${INITRD}" ] && command -v lsinitramfs >/dev/null 2>&1; then
+    lsinitramfs "${INITRD}" | grep -q 'virtio_blk' && vblk_initrd=1
   fi
+  [ -n "${vblk_builtin}" ] || [ -n "${vblk_initrd}" ] \
+    || fail "virtio_blk neither built into kernel ${KVER} nor in its initramfs"
+  echo "ok: virtio_blk reachable (builtin=${vblk_builtin:-0} initramfs=${vblk_initrd:-0})"
 
   # 5f. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it).
   DESKTOP=/usr/share/applications/proxmox-web-gui.desktop
