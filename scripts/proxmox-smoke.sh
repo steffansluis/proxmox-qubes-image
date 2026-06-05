@@ -89,7 +89,9 @@ done
 pct exec "${VMID}" -- ip -4 addr show eth0 | grep -q "${CT_IP}" \
   || fail "container did not get ${CT_IP} on eth0"
 echo "container networked:"
-pct exec "${VMID}" -- ip -br addr show eth0
+# Plain `ip addr` (no -br): the container's BusyBox ip lacks the -br/brief flag
+# that full iproute2 on the host has, and would print a usage error + exit 1.
+pct exec "${VMID}" -- ip addr show eth0
 
 # --- 4. The network seam: container -> gateway, and -> internet via NAT -----
 say "4/4 container connectivity (local gateway + NAT-out)"
