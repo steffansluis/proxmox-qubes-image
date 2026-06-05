@@ -308,6 +308,21 @@ fi
 # VGA screendumps only catch a frozen frame, not scrollback). Keep tty0 too so
 # the VGA console still works. Append once, idempotently, then refresh grub.
 say "4b/6 add serial console (console=ttyS0) to kernel cmdline"
+# SECOND boot-blocker found via serial log (run 27041811829): after the COW/
+# gptfix removal, boot cleared the initramfs (pve LVM activated) but then hit
+# `ALERT! /dev/mapper/dmroot does not exist. Dropping to a shell!`. Cause:
+# qubes-core-agent ships /etc/default/grub.d/30-qubes.cfg which forces
+# `GRUB_DEVICE=/dev/mapper/dmroot` and appends `root=/dev/mapper/dmroot` -- the
+# Qubes split-volume root name. The bare image booted on Proxmox's
+# `root=/dev/mapper/pve-root`; this drop-in only took effect once we regenerated
+# grub below. This image boots its OWN pve-root (under QEMU AND a real Qubes HVM
+# StandaloneVM, which boots its own kernel off its own root, never dom0's
+# dmroot), so the override is wrong everywhere -- remove it before update-grub.
+# It also sets GRUB_TIMEOUT=0 + console=hvc0; dropping it restores Proxmox's.
+QUBES_GRUB_DROPIN=/etc/default/grub.d/30-qubes.cfg
+if [ -e "${QUBES_GRUB_DROPIN}" ]; then
+  rm -f "${QUBES_GRUB_DROPIN}" && echo "removed Qubes grub override ${QUBES_GRUB_DROPIN} (forced root=dmroot)"
+fi
 SERIAL_ARGS="console=tty0 console=ttyS0,115200"
 refreshed=""
 # Proxmox boots EITHER via systemd-boot/proxmox-boot-tool (cmdline lives in
@@ -353,6 +368,17 @@ if [ -z "${refreshed}" ] && [ -f "${GRUBDEF}" ]; then
 fi
 
 [ -n "${refreshed}" ] || fail "no bootloader cmdline source found -- serial console not applied"
+
+# Tripwire: the regenerated boot config must point root at Proxmox's pve-root,
+# NOT the Qubes dmroot (the 30-qubes.cfg override we just removed). A stray
+# `root=/dev/mapper/dmroot` is exactly what dropped boot to (initramfs) last run.
+for cfg in /boot/grub/grub.cfg /boot/efi/EFI/proxmox/*/grub.cfg /etc/kernel/cmdline; do
+  [ -f "${cfg}" ] || continue
+  if grep -q 'root=/dev/mapper/dmroot' "${cfg}"; then
+    fail "boot config ${cfg} still sets root=/dev/mapper/dmroot -- would wedge boot"
+  fi
+done
+echo "ok: boot config targets pve-root (no stray root=dmroot)"
 
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
