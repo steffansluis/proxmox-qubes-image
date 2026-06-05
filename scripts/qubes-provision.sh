@@ -11,14 +11,21 @@
 #     Proxmox vmbr0 + ifupdown2 static setup. qrexec + GUI work over vchan,
 #     independent of networking. core-agent *Recommends* the networking pkg, so
 #     --no-install-recommends is mandatory, not just tidy.
-#   * Mask the two units that hard-block boot on a non-Qubes disk layout
-#     (qubes-rootfs-resize, qubes-mount-dirs order Before=local-fs.target and
-#     wait on Xen disk names dev-xvda/dev-xvdb that never appear on Proxmox's
-#     vda/sda). With those masked the image boots to login under BOTH real Xen
-#     AND plain QEMU (so the CI smoke test, which has no Xen backend, passes).
-#   * Everything else (qrexec-agent, qubesdb, meminfo-writer) fails SOFT without
-#     a Xen backend -- it retries but never blocks multi-user.target -- so we
-#     leave it enabled and it lights up for real once booted under Qubes.
+#   * Make boot Xen-OPTIONAL so the image comes up under BOTH real Xen and plain
+#     QEMU (the CI smoke test has no Xen backend). Two distinct boot-blockers:
+#       - Wrong-layout units -> MASK. qubes-rootfs-resize/qubes-mount-dirs/
+#         dev-xvdc1-swap wait on Qubes split-disk names (xvda/xvdb/xvdc) that
+#         never exist on this single-qcow2 image, even under Xen.
+#       - Xen-only early units -> GATE with ConditionVirtualization=xen drop-ins.
+#         qubes-sysinit.service busy-waits FOREVER on /dev/xen/xenbus and is
+#         ordered Before=sysinit.target, so with no Xen it wedges the whole boot.
+#         The gate runs it under Qubes but skips it cleanly under QEMU.
+#   * Repair the initramfs: qubes-kernel-vm-support forces MODULES=dep + only
+#     xen-blkfront, so a QEMU-virtio root can't be found. Restore MODULES=most +
+#     force virtio/dm modules and rebuild, or the image won't boot off Xen.
+#   * qrexec-agent + qubesdb are left ENABLED: they fail SOFT without a Xen
+#     backend (retry within their start timeout, never block boot) and are what
+#     light up the integration once under Qubes -- masking them would defeat it.
 #
 # Idempotent: safe to re-run. Writes /var/lib/qubes-provision.done on success.
 set -euo pipefail
@@ -52,7 +59,7 @@ CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-trixie}")"
 # rather than enumerate them, disable EVERY apt source that points at
 # enterprise.proxmox.com. Then add the no-subscription repo -- the community
 # homelab default (part of "best practices"). PVE 9 uses deb822 .sources.
-say "0/5 switch to Proxmox no-subscription repos"
+say "0/6 switch to Proxmox no-subscription repos"
 # Rename any apt source file referencing the enterprise host to *.disabled (apt
 # ignores files not ending in .list/.sources). Iterate the .list/.sources files
 # directly -- /etc/apt filenames never contain spaces, so a simple loop is safe
@@ -81,7 +88,7 @@ if [ -f "$PROXYLIB" ] && ! grep -q "void({ //NoMoreNagging" "$PROXYLIB"; then
 fi
 
 # --- 1. Qubes R4.3 VM apt repository ---------------------------------------
-say "1/5 add Qubes R4.3 VM repository (${CODENAME})"
+say "1/6 add Qubes R4.3 VM repository (${CODENAME})"
 install -d -m 0755 /etc/apt/keyrings
 GNUPGHOME="$(mktemp -d)"; export GNUPGHOME
 
@@ -112,7 +119,7 @@ deb [arch=amd64 signed-by=${KEYRING}] https://deb.qubes-os.org/r4.3/vm ${CODENAM
 EOF
 
 # --- 2. Install the guest agents (NO networking agent) ----------------------
-say "2/5 install qubes-core-agent + qubes-gui-agent (no networking agent)"
+say "2/6 install qubes-core-agent + qubes-gui-agent (no networking agent)"
 export DEBIAN_FRONTEND=noninteractive
 # DEBIAN_FRONTEND=noninteractive suppresses debconf prompts but NOT dpkg's
 # conffile prompts. qubes-core-agent ships its own /etc/fstab (built for the
@@ -158,19 +165,86 @@ fi
 # option Signed-By". Remove ours and let the package's own config stand.
 rm -f "${LIST}" "${KEYRING}"
 
-# --- 3. Neutralise the boot-blocking units ----------------------------------
-# These two oneshots order Before=local-fs.target and block on Xen disk names
-# (dev-xvda/dev-xvdb) that don't exist on Proxmox's vda layout -> boot hangs.
-# Masking them is safe here precisely because root is a single real qcow2
-# partition (not a Qubes split root/private layout needing a 2nd volume).
-say "3/5 mask boot-blocking Qubes units (rootfs-resize, mount-dirs)"
+# --- 3. Make boot Xen-optional (systemd) ------------------------------------
+# Several Qubes units assume a Xen backend and HARD-block boot without one, so
+# this image -- which must ALSO boot under plain QEMU (CI smoke) and as a
+# Proxmox VM -- would hang. Two classes, handled differently:
+#
+#   a) Units that are simply WRONG for this image's disk layout -> MASK. Root is
+#      one real qcow2 partition, not the Qubes split xvda/xvdb/xvdc layout, so
+#      qubes-rootfs-resize (waits dev-xvda), qubes-mount-dirs (mounts /rw,/home
+#      off xvdb) and dev-xvdc1-swap (swapon /dev/xvdc1) can never succeed even
+#      under real Xen here. Masking is correct, not just expedient.
+#
+#   b) Units we DO want under real Xen (they power the integration) but that
+#      stall without Xen -> gate on ConditionVirtualization=xen via a drop-in,
+#      so they SKIP cleanly under QEMU yet run normally under Qubes. The critical
+#      one is qubes-sysinit.service: its helper busy-waits FOREVER on
+#      /dev/xen/xenbus and is ordered Before=sysinit.target, so with no Xen it
+#      wedges the whole boot (the 6-min CI hang). qubes-early-vm-config is the
+#      same shape. qubes-db + qubes-qrexec-agent are deliberately left ENABLED:
+#      they fail soft (local daemon / retry) within their start timeout and are
+#      what make qrexec work once under Xen -- masking them would defeat the
+#      integration this image exists to provide.
+say "3/6 make boot Xen-optional (mask wrong-layout units, gate Xen-only units)"
 systemctl mask qubes-rootfs-resize.service qubes-mount-dirs.service \
-  || fail "could not mask boot-blocking units"
+  || fail "could not mask wrong-layout Qubes units"
+# dev-xvdc1-swap (swapon /dev/xvdc1) is also wrong for this single-disk image;
+# mask only if the preset actually shipped the unit (tolerate its absence).
+if systemctl cat dev-xvdc1-swap.service >/dev/null 2>&1; then
+  systemctl mask dev-xvdc1-swap.service || fail "could not mask dev-xvdc1-swap"
+fi
+# Gate the Xen-only early units so they run under real Xen but skip under QEMU.
+for unit in qubes-sysinit.service qubes-early-vm-config.service; do
+  d="/etc/systemd/system/${unit}.d"
+  install -d -m 0755 "${d}"
+  cat >"${d}/10-skip-without-xen.conf" <<'EOF'
+[Unit]
+# Baked by qubes-provision.sh. This image must also boot under plain QEMU (no
+# Xen). qubes-sysinit.sh busy-waits forever on /dev/xen/xenbus and is ordered
+# Before=sysinit.target, so without Xen it stalls the entire boot. Run these
+# only under real Xen (Qubes); skip cleanly (condition-not-met) everywhere else.
+ConditionVirtualization=xen
+EOF
+done
 
-# --- 4. A browser to render the web UI, + the app-menu shortcut -------------
+# --- 4. Repair the initramfs so it can mount the virtio root ----------------
+# qubes-kernel-vm-support drops /usr/share/initramfs-tools/conf.d/qubes.conf
+# with `MODULES=dep` (overriding Debian's `MODULES=most`) and an initramfs hook
+# that force-loads xen-blkfront but NO virtio driver, then its postinst rebuilt
+# /boot/initrd.img. Under plain QEMU the disk is virtio, so a `dep` initramfs
+# omits virtio_blk/virtio_pci, the kernel never sees the disk, /dev/mapper/
+# pve-root never appears, and boot drops to the initramfs emergency shell (the
+# silent hang under `quiet`). Real Xen would be fine, but this image must boot
+# both ways. Restore `MODULES=most` via a higher-priority conf (conf.d is read
+# in sorted order, last wins) AND belt-and-suspenders force the virtio + dm
+# modules in, then rebuild every installed kernel's initramfs.
+say "4/6 repair initramfs (keep virtio/dm so the LVM root mounts off Xen)"
+cat >/etc/initramfs-tools/conf.d/zz-proxmox-force-most.conf <<'EOF'
+# Baked by qubes-provision.sh. Overrides qubes.conf's MODULES=dep: this image
+# also boots under plain QEMU (virtio disk), where a `dep` initramfs would lack
+# virtio_blk and fail to find the LVM root. `most` bundles the common storage
+# drivers (incl. virtio) like a stock Debian initramfs.
+MODULES=most
+EOF
+for m in virtio_pci virtio_blk virtio_scsi dm_mod dm_snapshot; do
+  grep -qxF "$m" /etc/initramfs-tools/modules 2>/dev/null \
+    || echo "$m" >>/etc/initramfs-tools/modules
+done
+update-initramfs -u -k all || fail "update-initramfs failed"
+# Verify the just-built initramfs really carries virtio-blk -- if this regresses
+# the image won't boot off Xen, so make it a hard, fail-fast guard.
+KVER="$(ls -1 /boot/initrd.img-* 2>/dev/null | sed 's#.*/initrd.img-##' | sort -V | tail -1)"
+if [ -n "${KVER}" ] && command -v lsinitramfs >/dev/null 2>&1; then
+  lsinitramfs "/boot/initrd.img-${KVER}" | grep -q 'virtio_blk' \
+    || fail "rebuilt initramfs (${KVER}) lacks virtio_blk -- would not boot on QEMU"
+  echo "ok: initramfs ${KVER} contains virtio_blk"
+fi
+
+# --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
 # Chromium --app window, which the dom0 WM decorates like any native app window.
-say "4/5 install chromium + 'Proxmox Web GUI' .desktop"
+say "5/6 install chromium + 'Proxmox Web GUI' .desktop"
 # desktop-file-utils provides desktop-file-validate, which both this script and
 # the smoke test's stage 5 rely on; it isn't guaranteed on a minimal PVE install.
 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
@@ -203,8 +277,8 @@ EOF
 desktop-file-validate /usr/share/applications/proxmox-web-gui.desktop \
   || fail "proxmox-web-gui.desktop failed desktop-file-validate"
 
-# --- 5. Done ----------------------------------------------------------------
-say "5/5 finalize"
+# --- 6. Done ----------------------------------------------------------------
+say "6/6 finalize"
 apt-get clean
 date -u +%FT%TZ >"${MARKER}"
 echo "qubes-provision complete -> ${MARKER}"

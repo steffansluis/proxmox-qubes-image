@@ -177,7 +177,7 @@ else
   fi
   echo "ok: qubes-core-agent-networking correctly absent"
 
-  # 5c. The two boot-blocking units are masked (symlinked to /dev/null), so the
+  # 5c. The wrong-disk-layout units are masked (symlinked to /dev/null), so the
   # image reaches login on a non-Qubes disk layout -- this VERY boot proves it.
   for unit in qubes-rootfs-resize.service qubes-mount-dirs.service; do
     [ "$(systemctl is-enabled "${unit}" 2>/dev/null)" = "masked" ] \
@@ -185,7 +185,34 @@ else
   done
   echo "ok: rootfs-resize + mount-dirs masked (and we booted fine)"
 
-  # 5d. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it).
+  # 5d. The Xen-only early units are GATED (not masked): a drop-in adds
+  # ConditionVirtualization=xen so they skip under QEMU but run under real Xen.
+  # qubes-sysinit busy-waits forever on /dev/xen/xenbus ordered Before=sysinit
+  # .target, so without this gate boot wedges -- that we got here proves it skips.
+  for unit in qubes-sysinit.service qubes-early-vm-config.service; do
+    DROPIN="/etc/systemd/system/${unit}.d/10-skip-without-xen.conf"
+    [ -f "${DROPIN}" ] \
+      || fail "${unit} missing Xen-gate drop-in ${DROPIN} -- boot would hang off Xen"
+    grep -q 'ConditionVirtualization=xen' "${DROPIN}" \
+      || fail "${DROPIN} does not gate on ConditionVirtualization=xen"
+    # Under this QEMU boot (no Xen) the condition must NOT be met -> inactive.
+    [ "$(systemctl is-active "${unit}" 2>/dev/null)" != "active" ] \
+      || fail "${unit} is active under QEMU -- Xen gate failed, would have hung"
+  done
+  echo "ok: qubes-sysinit + early-vm-config gated to Xen (skipped here)"
+
+  # 5e. The initramfs must carry virtio_blk or the LVM root won't mount under
+  # QEMU. qubes-kernel-vm-support's MODULES=dep would have dropped it; the
+  # provision step restores MODULES=most + force-includes virtio. This running
+  # system booted off that initramfs, but assert it explicitly for clarity.
+  INITRD="$(ls -1 /boot/initrd.img-* 2>/dev/null | sort -V | tail -1)"
+  if [ -n "${INITRD}" ] && command -v lsinitramfs >/dev/null 2>&1; then
+    lsinitramfs "${INITRD}" | grep -q 'virtio_blk' \
+      || fail "initramfs ${INITRD} lacks virtio_blk -- would not boot under QEMU"
+    echo "ok: initramfs $(basename "${INITRD}") contains virtio_blk"
+  fi
+
+  # 5f. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it).
   DESKTOP=/usr/share/applications/proxmox-web-gui.desktop
   [ -f "${DESKTOP}" ] || fail "missing ${DESKTOP}"
   desktop-file-validate "${DESKTOP}" \
