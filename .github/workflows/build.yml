@@ -135,6 +135,9 @@ jobs:
       - name: Smoke-test the image
         if: steps.kvm.outputs.accel == 'kvm'
         run: |
+          # pipefail so a smoke failure isn't masked by tee's exit 0 -- the
+          # pipeline must carry the script's real status to gate the push.
+          set -o pipefail
           chmod +x scripts/smoke-test.sh scripts/proxmox-smoke.sh
           scripts/smoke-test.sh output-proxmox/proxmox-ve.qcow2 \
             2>&1 | tee smoke.log

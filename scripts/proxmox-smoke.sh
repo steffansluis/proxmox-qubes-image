@@ -98,12 +98,14 @@ pct exec "${VMID}" -- ping -c2 -W2 "${GW_IP}" >/dev/null \
   || fail "container cannot reach its gateway ${GW_IP} on vmbr1"
 echo "ok: container -> ${GW_IP} (vmbr1 local)"
 
-# 4b. NAT-out: TCP to a bare internet IP. We use TCP (HTTP to 1.1.1.1), NOT
-# ICMP, because QEMU's slirp user-net drops outbound ping but forwards TCP --
-# so this proves the masquerade path end-to-end without a DNS dependency.
-pct exec "${VMID}" -- wget -T 15 -q -O /dev/null http://1.1.1.1 \
-  || fail "container has no NAT-out internet via vmbr0 masquerade"
-echo "ok: container -> http://1.1.1.1 (NAT-out through vmbr0)"
+# 4b. NAT-out: open a raw TCP connection to a bare internet IP. We probe TCP,
+# NOT ICMP, because QEMU's slirp user-net drops outbound ping but forwards TCP.
+# A bare connect (BusyBox `nc` to 1.1.1.1:53, Cloudflare DNS-over-TCP) proves
+# the masquerade path end-to-end with NO dependency on DNS, TLS, or HTTP status
+# semantics -- it succeeds iff a SYN/ACK comes back through the vmbr0 NAT.
+pct exec "${VMID}" -- sh -c 'nc -w8 1.1.1.1 53 </dev/null' \
+  || fail "container has no NAT-out internet via vmbr0 masquerade (TCP 1.1.1.1:53)"
+echo "ok: container -> 1.1.1.1:53 TCP (NAT-out through vmbr0)"
 
 # --- teardown (best-effort; CI throws the VM away anyway) -------------------
 say "cleanup"

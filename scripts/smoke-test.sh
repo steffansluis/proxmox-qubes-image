@@ -20,9 +20,13 @@ PASSWORD="proxmox"
 QEMU_PID=""
 OVERLAY=""
 
+# Note: ssh takes the port as -p, scp as -P -- keep the port out of the shared
+# opts and add it per-tool, or scp reads "-p <port>" as preserve-times + a
+# bogus filename.
 ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-          -o ConnectTimeout=5 -o LogLevel=ERROR -p "${SSH_PORT}")
-sshp() { sshpass -p "${PASSWORD}" ssh "${ssh_opts[@]}" root@localhost "$@"; }
+          -o ConnectTimeout=5 -o LogLevel=ERROR)
+sshp() { sshpass -p "${PASSWORD}" ssh "${ssh_opts[@]}" -p "${SSH_PORT}" root@localhost "$@"; }
+scpp() { sshpass -p "${PASSWORD}" scp "${ssh_opts[@]}" -P "${SSH_PORT}" "$@"; }
 
 cleanup() {
   [ -n "${QEMU_PID}" ] && kill "${QEMU_PID}" 2>/dev/null || true
@@ -59,12 +63,13 @@ done
 echo "SSH up after ~$((i*2))s."
 
 echo "Copying smoke test into guest..."
-sshpass -p "${PASSWORD}" scp "${ssh_opts[@]}" \
-  "$(dirname "$0")/proxmox-smoke.sh" root@localhost:/root/proxmox-smoke.sh
+scpp "$(dirname "$0")/proxmox-smoke.sh" root@localhost:/root/proxmox-smoke.sh
 
 echo "Running in-guest smoke test..."
-sshp 'chmod +x /root/proxmox-smoke.sh && /root/proxmox-smoke.sh'
-rc=$?
+# Capture rc explicitly: under `set -e` a bare failing command would abort the
+# script before we could shut the guest down gracefully.
+rc=0
+sshp 'chmod +x /root/proxmox-smoke.sh && /root/proxmox-smoke.sh' || rc=$?
 
 # Graceful shutdown so QEMU exits cleanly; cleanup() is the hard fallback.
 sshp 'poweroff' 2>/dev/null || true
