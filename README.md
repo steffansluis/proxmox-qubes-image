@@ -137,8 +137,22 @@ answer.toml              Unattended-install answer file (PVE 8.2+ schema)
 proxmox.pkr.hcl          Packer QEMU builder -> qcow2
 scripts/first-boot.sh    Optional first-boot hook (repos, nag)
 scripts/gen-answer.sh    Regenerate the password hash
-.github/workflows/       CI: build + push to GHCR via ORAS
+scripts/smoke-test.sh    CI: boot the image headless + run the in-guest smoke
+scripts/proxmox-smoke.sh CI: in-guest assertions (API, vmbr1 NAT, LXC, NAT-out)
+.github/workflows/       CI: build -> smoke-test -> push to GHCR via ORAS
 ```
+
+### CI smoke test
+
+After Packer builds the qcow2, CI boots it headless (KVM) against a disposable
+overlay and SSHes in as `root` to validate the *services-domain* patterns the
+image exists for: the Proxmox API is alive, an internal NAT bridge `vmbr1`
+comes up, an **unprivileged LXC container** boots on it, and that container
+reaches both its gateway and the internet (NAT-out through `vmbr0`). A failure
+**gates the GHCR push**, so a broken image is never published. The overlay
+keeps the published artifact pristine. LXC is namespaces-only, so this needs no
+nested virtualization -- it validates exactly the container workloads the Qubes
+HVM can run. The full transcript uploads as the `smoke-log` artifact.
 
 ## References
 

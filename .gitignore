@@ -12,3 +12,6 @@ prepared.iso
 .packer.d/
 crash.log
 *.pkr.json
+
+# python bytecode
+__pycache__/

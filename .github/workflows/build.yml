@@ -48,8 +48,9 @@ jobs:
         run: |
           sudo apt-get update
           # qemu-utils: qemu-img. xorriso/curl: ISO handling.
+          # sshpass: non-interactive root login for the post-build smoke test.
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils xorriso curl zstd ca-certificates
+            qemu-system-x86 qemu-utils xorriso curl zstd ca-certificates sshpass
 
       - name: Install proxmox-auto-install-assistant
         run: |
@@ -123,6 +124,27 @@ jobs:
         with:
           name: console-screenshots
           path: screenshots/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Boot the freshly built image and validate the services-domain patterns
+      # (Proxmox API, vmbr1 NAT bridge, unprivileged LXC, container NAT-out)
+      # BEFORE publishing -- a failed smoke gates the GHCR push so we never ship
+      # a broken image. Only runs when KVM is present; TCG boot is too slow to
+      # be worth gating on. LXC is namespaces-only, so no nested virt needed.
+      - name: Smoke-test the image
+        if: steps.kvm.outputs.accel == 'kvm'
+        run: |
+          chmod +x scripts/smoke-test.sh scripts/proxmox-smoke.sh
+          scripts/smoke-test.sh output-proxmox/proxmox-ve.qcow2 \
+            2>&1 | tee smoke.log
+
+      - name: Upload smoke-test log
+        if: always() && steps.kvm.outputs.accel == 'kvm'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-log
+          path: smoke.log
           if-no-files-found: warn
           retention-days: 14
 
