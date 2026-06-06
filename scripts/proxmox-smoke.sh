@@ -349,6 +349,57 @@ else
     echo "ok: cron.service active (Qubes crond gate cleared)"
   fi
 
+  # 5h''. SELF-DISCOVERING qubes-service-gate audit. cron was found reactively;
+  # this generalizes it so an UNKNOWN gate on a Proxmox-needed service fails CI
+  # instead of silently disabling a service on the live qube. We enumerate every
+  # systemd drop-in qubes-core-agent baked under <unit>.d/ that gates a unit on
+  # /var/run/qubes-service/<flag>, and for each unit on our Proxmox MUST-RUN list
+  # assert it is actually active on this (flag-less) QEMU boot -- i.e. its gate has
+  # been cleared. Units NOT on the must-run list are reported for visibility only
+  # (e.g. cups/firewalld/NetworkManager, which Proxmox doesn't want running).
+  echo "qubes-service gate audit:"
+  # Proxmox needs these running regardless of any Qubes flag. Time sync is covered
+  # separately (chrony.service drop-in is empty + qubes-sync-time.timer); included
+  # here only if a gate is detected on it.
+  MUSTRUN=" cron anacron postfix rsyslog ssh sshd pveproxy pvedaemon pve-cluster "
+  gate_audit_ok=1
+  for ddir in /usr/lib/systemd/system/*.d /lib/systemd/system/*.d /etc/systemd/system/*.d; do
+    [ -d "${ddir}" ] || continue
+    # Does any drop-in here gate on a qubes-service flag?
+    if grep -rslq 'ConditionPathExists=.*qubes-service' "${ddir}" 2>/dev/null; then
+      unit="$(basename "${ddir}" .d)"
+      flag="$(grep -rho 'ConditionPathExists=[!|]*/\(var/\)\?run/qubes-service/[^ ]*' "${ddir}" 2>/dev/null \
+              | head -n1 | sed 's#.*/qubes-service/##')"
+      base="${unit%@*}"   # normalize templated units (getty@.service -> getty)
+      case " ${MUSTRUN} " in
+        *" ${base} "*)
+          if systemctl cat "${unit}" >/dev/null 2>&1; then
+            if [ "$(systemctl is-active "${unit}" 2>/dev/null)" = "active" ]; then
+              echo "  ok ${unit}: gated on '${flag}' but ACTIVE (gate cleared)"
+            else
+              echo "  FAIL ${unit}: gated on qubes-service '${flag}' and NOT active -- Proxmox needs it; clear the gate"
+              gate_audit_ok=0
+            fi
+          fi ;;
+        *)
+          echo "  info ${unit}: gated on qubes-service '${flag}' (not on Proxmox must-run list; left gated)" ;;
+      esac
+    fi
+  done
+  [ "${gate_audit_ok}" = "1" ] \
+    || fail "a Proxmox-required service is still gated off by a Qubes qubes-service flag (see FAIL lines above)"
+  echo "ok: no Proxmox-required service left gated by a qubes-service flag"
+
+  # 5h'''. The Qubes apt updates-proxy must NOT be configured -- this image does
+  # direct internet over vmbr0 and has no :8082 forwarder, so a baked proxy would
+  # hang every apt/Proxmox package operation. qubes-provision.sh removes it; assert.
+  [ ! -e /etc/apt/apt.conf.d/01qubes-proxy ] \
+    || fail "/etc/apt/apt.conf.d/01qubes-proxy present -- apt would route through the dead Qubes updates proxy"
+  if grep -rIls '127\.0\.0\.1:8082\|10\.137\.255\.254:8082' /etc/apt/apt.conf.d/ 2>/dev/null | grep -q .; then
+    fail "an apt.conf.d file references the Qubes updates proxy (:8082) -- apt would fail with direct networking"
+  fi
+  echo "ok: no Qubes apt updates-proxy config (apt uses direct vmbr0 networking)"
+
   # The PVE cluster fs must be up and the web server must answer TLS on loopback.
   [ "$(systemctl is-active pve-cluster 2>/dev/null)" = "active" ] \
     || fail "pve-cluster (pmxcfs) not active -- /etc/pve won't mount, web UI cert missing"

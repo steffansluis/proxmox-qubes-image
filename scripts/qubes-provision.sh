@@ -290,20 +290,46 @@ fi
 # with a higher-priority drop-in (empty assignment resets the condition list, so
 # cron starts unconditionally as on a normal Debian host). Same reset idiom as
 # the random-seed ExecStartPre fix above.
-if systemctl cat cron.service >/dev/null 2>&1; then
-  d="/etc/systemd/system/cron.service.d"
-  install -d -m 0755 "${d}"
-  cat >"${d}/40-proxmox-force-cron.conf" <<'EOF'
+# cron AND anacron both ship cron.service.d/anacron.service.d 30_qubes.conf gating
+# them on /var/run/qubes-service/crond. Clear both with the empty-assignment reset
+# idiom so the scheduled-job stack starts unconditionally (vzdump, e2scrub, ZFS
+# maintenance, logrotate/apt-compat/man-db dailies). Looping keeps the two in sync.
+for svc in cron anacron; do
+  if systemctl cat "${svc}.service" >/dev/null 2>&1; then
+    d="/etc/systemd/system/${svc}.service.d"
+    install -d -m 0755 "${d}"
+    cat >"${d}/40-proxmox-force-${svc}.conf" <<'EOF'
 [Unit]
-# Baked by qubes-provision.sh. qubes-core-agent gates cron on a qubes-service
-# flag file (/var/run/qubes-service/crond) that never exists without the Qubes
-# networking agent / a dom0 qvm-service. Proxmox needs cron (vzdump backups,
-# e2scrub, ZFS maintenance, logrotate). Empty assignment clears that condition
-# so cron always starts, as on a normal Debian host.
+# Baked by qubes-provision.sh. qubes-core-agent gates this on a qubes-service flag
+# file (/var/run/qubes-service/crond) that never exists without the Qubes
+# networking agent / a dom0 qvm-service. Proxmox needs the scheduled-job stack
+# (vzdump backups, e2scrub, ZFS maintenance, logrotate). Empty assignment clears
+# that condition so it always starts, as on a normal Debian host.
 ConditionPathExists=
 EOF
-  echo "cleared the Qubes crond gate (cron will run for vzdump/logrotate/etc.)"
+    echo "cleared the Qubes crond gate on ${svc}.service"
+  fi
+done
+
+# qubes-core-agent's /usr/lib/qubes/update-proxy-configs writes
+# /etc/apt/apt.conf.d/01qubes-proxy pointing apt at the Qubes updates proxy
+# (http://127.0.0.1:8082/, qrexec-forwarded to sys-net) WHEN the qubes-service
+# flag `updates-proxy-setup` (or `yum-proxy-setup`) is set; with no flag it
+# self-deletes the file. This image does DIRECT internet over the bridged vmbr0
+# and has no updates-proxy forwarder, so if that file ever exists EVERY `apt
+# update` would hang/fail against a dead 127.0.0.1:8082 -- breaking Proxmox
+# package installs and the apt-compat/unattended dailies. Belt-and-suspenders:
+# remove it at bake (the boot script re-removes it too, since the flag is absent),
+# and assert it's gone so a future agent-layout change can't silently reintroduce
+# a proxy this image can't reach.
+rm -f /etc/apt/apt.conf.d/01qubes-proxy
+if [ -e /etc/apt/apt.conf.d/01qubes-proxy ]; then
+  fail "/etc/apt/apt.conf.d/01qubes-proxy still present -- apt would route through the dead Qubes updates proxy (127.0.0.1:8082)"
 fi
+if grep -rIls '127\.0\.0\.1:8082\|10\.137\.255\.254:8082' /etc/apt/apt.conf.d/ 2>/dev/null | grep -q .; then
+  fail "an apt.conf.d file still references the Qubes updates proxy (:8082) -- apt would fail with direct networking"
+fi
+echo "ok: no Qubes apt updates-proxy config (apt uses direct vmbr0 networking)"
 
 PROTDIR=/etc/qubes/protected-files.d
 install -d -m 0755 "${PROTDIR}"
