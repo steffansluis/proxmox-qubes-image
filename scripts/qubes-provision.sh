@@ -686,29 +686,81 @@ apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "${CHROMIUM_BIN}" ] || fail "no chromium binary found after install"
 
-# The Exec line runs Chromium as ROOT (Proxmox is all-root) under qubes-gui-
-# agent's DUMMY framebuffer X server (no GPU). Each flag is load-bearing:
-#  --no-sandbox        Chromium HARD-REFUSES to start as root without this
-#                      (crbug.com/638180); the old launcher only "worked" because
-#                      ... it didn't, as root -- this is mandatory, not optional.
-#  --user-data-dir     a dedicated, stable profile. Avoids the SingletonLock/stale
-#                      -cache wedge: the web UI showed a white page (500 on
-#                      /PVE/StdWorkspace.js -- ExtJS's loader fallback when an
-#                      earlier cached/partial pvemanagerlib.js threw) after the
-#                      browser cached errors during the pre-fix ERR_TIMED_OUT era.
-#  --disk-cache-dir=/tmp/... + --disk-cache-size=1  keep the HTTP cache tiny and
-#                      on tmpfs so a stale bundle can never persist across boots.
-#  --disable-gpu       the dummy framebuffer has no GPU; GPU/compositing init
-#                      otherwise stalls or blanks the window.
-#  --disable-dev-shm-usage   small /dev/shm -> renderer crash without this.
-#  --password-store=basic + --disable-features=Translate   no gnome-keyring/extra
-#                      D-Bus deps on a headless host.
-#  --no-first-run --no-default-browser-check   skip dialogs that can swallow --app.
+# The shortcut does NOT exec Chromium directly. It runs a wrapper that makes the
+# launch SELF-HEALING against the two failure modes we actually observed on the
+# live qube: (a) the white page (500 on /PVE/StdWorkspace.js -- ExtJS's class-
+# loader fallback that only fires when a cached/partial pvemanagerlib.js failed
+# to define PVE.StdWorkspace), and (b) the startup RACE -- the menu entry can
+# fire before pmxcfs -> pveproxy finish coming up at boot, so the first load hits
+# a not-yet-listening :8006, errors, and those errors get cached -> (a) on the
+# next launch. "Restarting the VM let me launch the GUI" was exactly this race.
+# The wrapper purges stale caches, then WAITS for :8006 to actually answer before
+# opening the window -- so a clean image can no longer wedge itself into a white
+# page regardless of boot timing. The wrapper lives on the immutable root in
+# /usr/bin (NOT /usr/local, which qubes-core-agent bind-mounts from /rw/usrlocal
+# and would shadow by the next boot, same reason as qubes-vmbr0-netcfg).
+#
+# Chromium flags inside the wrapper are each load-bearing under qubes-gui-agent's
+# DUMMY framebuffer X server (no GPU), running as ROOT (Proxmox is all-root):
+#  --no-sandbox        Chromium HARD-REFUSES to start as root without it (crbug
+#                      .com/638180) -- mandatory, not optional.
+#  --user-data-dir     a dedicated, stable profile (keeps the login ticket across
+#                      launches; isolated from any poisoned default profile).
+#  --disk-cache-dir=/tmp/... + --disk-cache-size=1  tiny HTTP cache on tmpfs so a
+#                      stale bundle can never persist across boots.
+#  --disable-gpu / --disable-dev-shm-usage   dummy framebuffer has no GPU; small
+#                      /dev/shm -> renderer crash without these.
+#  --password-store=basic / --disable-features=Translate   no keyring/extra D-Bus.
+#  --no-first-run / --no-default-browser-check   skip dialogs that swallow --app.
 #  --test-type         suppress the unsupported-flags infobar.
-# NOTE: --ignore-certificate-errors was REMOVED -- Chromium ignores it in --app
-# mode and prints a warning bar; the self-signed PVE cert still loads the page
-# (only a cosmetic NET::ERR warning that --app dismisses), and StdWorkspace is
-# served fine over it. Kept simple: we do not bypass TLS, we just open the UI.
+# --ignore-certificate-errors is intentionally absent -- it's a no-op in --app
+# mode; the self-signed PVE cert still loads the UI fine.
+LAUNCHER=/usr/bin/proxmox-web-gui
+cat >"${LAUNCHER}" <<'EOF'
+#!/bin/sh
+# Robust launcher for the local Proxmox VE web UI. Baked by qubes-provision.sh.
+# Self-heals the white-page (stale-cache) and startup-race failures; see the
+# header in qubes-provision.sh for the full rationale.
+set -u
+URL=https://localhost:8006
+PROFILE=/root/.config/proxmox-web-gui
+CACHE=/tmp/proxmox-web-gui-cache
+
+# Resolve the browser at runtime (chromium vs chromium-browser across releases).
+CHROMIUM="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
+[ -n "${CHROMIUM}" ] || { echo "proxmox-web-gui: no chromium binary found" >&2; exit 1; }
+
+# 1. Self-heal: drop stale HTTP/code caches (NOT cookies/login ticket). A partial
+#    or errored pvemanagerlib.js cached on a prior boot is what makes ExtJS fall
+#    back to GET /PVE/StdWorkspace.js -> 500 -> white page. Purging guarantees a
+#    fresh fetch of the bundles every launch.
+rm -rf "${CACHE}" \
+       "${PROFILE}/Default/Cache" "${PROFILE}/Default/Code Cache" \
+       "${PROFILE}/Default/GPUCache" "${PROFILE}/Default/Service Worker" \
+       2>/dev/null || true
+
+# 2. Wait for the web stack to actually serve before opening the window, so we
+#    never cache an error from a not-yet-listening :8006 at boot. Poll up to ~90s.
+i=0
+while [ "${i}" -lt 90 ]; do
+  code="$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "${URL}" 2>/dev/null || echo 000)"
+  case "${code}" in 200|401) break ;; esac
+  i=$((i + 1))
+  sleep 1
+done
+
+# 3. Launch the chromeless --app window (dom0's WM decorates it like a native app).
+exec "${CHROMIUM}" --app="${URL}" --no-sandbox \
+  --user-data-dir="${PROFILE}" \
+  --disk-cache-dir="${CACHE}" --disk-cache-size=1 \
+  --disable-gpu --disable-dev-shm-usage \
+  --password-store=basic --disable-features=Translate \
+  --no-first-run --no-default-browser-check --test-type "$@"
+EOF
+chmod 0755 "${LAUNCHER}"
+# Self-check: it must parse and resolve to the chromium we just installed.
+sh -n "${LAUNCHER}" || fail "${LAUNCHER} is not valid POSIX sh"
+
 install -d -m 0755 /usr/share/applications
 cat >/usr/share/applications/proxmox-web-gui.desktop <<EOF
 [Desktop Entry]
@@ -717,7 +769,7 @@ Version=1.0
 Name=Proxmox Web GUI
 GenericName=Proxmox VE Management
 Comment=Open the Proxmox VE web interface
-Exec=${CHROMIUM_BIN} --app=https://localhost:8006 --no-sandbox --user-data-dir=/root/.config/proxmox-web-gui --disk-cache-dir=/tmp/proxmox-web-gui-cache --disk-cache-size=1 --disable-gpu --disable-dev-shm-usage --password-store=basic --disable-features=Translate --no-first-run --no-default-browser-check --test-type
+Exec=${LAUNCHER}
 Icon=proxmox-ve
 Terminal=false
 Categories=Network;

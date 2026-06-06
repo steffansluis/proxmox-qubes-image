@@ -1,0 +1,74 @@
+Booting output-proxmox/proxmox-ve.qcow2 via overlay /tmp/tmp.5pEiMHyT8t.qcow2 headless (KVM)...
+Waiting for Proxmox SSH (up to ~6 min)...
+SSH up after ~8s.
+Copying smoke test into guest...
+Running in-guest smoke test...
+
+=== 1/5 Proxmox identity + API ===
+pve-manager/9.2.2/b9984c6d90a4bd80 (running kernel: 7.0.2-6-pve)
+{"release":"9.2","repoid":"b9984c6d90a4bd80","version":"9.2.2"}
+
+=== 2/5 internal NAT bridge vmbr1 ===
+
+=== 2a/5 vmbr0 has a real enslaved uplink (eth0) ===
+vmbr0 ports: eth0
+ok: eth0 enslaved to vmbr0 (uplink present)
+vmbr1 up: vmbr1            UNKNOWN        10.10.10.1/24 fe80::e41f:6eff:fee2:1ed1/64 
+
+=== 3/5 LXC lifecycle (download template, create, start) ===
+update successful
+template: alpine-3.23-default_20260116_amd64.tar.xz
+downloading http://download.proxmox.com/images/system/alpine-3.23-default_20260116_amd64.tar.xz to /var/lib/vz/template/cache/alpine-3.23-default_20260116_amd64.tar.xz
+--2026-06-06 16:58:48--  http://download.proxmox.com/images/system/alpine-3.23-default_20260116_amd64.tar.xz
+Resolving download.proxmox.com (download.proxmox.com)... 170.130.165.90, 2a0b:7140:8:100::90
+Connecting to download.proxmox.com (download.proxmox.com)|170.130.165.90|:80... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 3322588 (3.2M) [application/octet-stream]
+Saving to: '/var/lib/vz/template/cache/alpine-3.23-default_20260116_amd64.tar.xz.tmp_dwnl.1751'
+     0K ...                                100% 8.08M=0.4s
+2026-06-06 16:58:49 (8.08 MB/s) - '/var/lib/vz/template/cache/alpine-3.23-default_20260116_amd64.tar.xz.tmp_dwnl.1751' saved [3322588/3322588]
+calculating checksum...OK, checksum verified
+download of 'http://download.proxmox.com/images/system/alpine-3.23-default_20260116_amd64.tar.xz' to '/var/lib/vz/template/cache/alpine-3.23-default_20260116_amd64.tar.xz' finished
+  Logical volume "vm-900-disk-0" created.
+  Logical volume pve/vm-900-disk-0 changed.
+Creating filesystem with 262144 4k blocks and 65536 inodes
+Filesystem UUID: cdebce5b-3d91-4b48-abc5-73a144441093
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376
+extracting archive '/var/lib/vz/template/cache/alpine-3.23-default_20260116_amd64.tar.xz'
+Total bytes read: 11642880 (12MiB, 81MiB/s)
+Detected container architecture: amd64
+container networked:
+2: eth0@if5: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether bc:24:11:51:63:7e brd ff:ff:ff:ff:ff:ff
+    inet 10.10.10.10/24 scope global eth0
+       valid_lft forever preferred_lft forever
+    inet6 fe80::be24:11ff:fe51:637e/64 scope link 
+       valid_lft forever preferred_lft forever
+
+=== 4/5 container connectivity (local gateway + NAT-out) ===
+ok: container -> 10.10.10.1 (vmbr1 local)
+ok: container -> 1.1.1.1:53 TCP (NAT-out through vmbr0)
+
+=== 5/5 baked-in Qubes guest integration ===
+ok: qubes-core-agent + qubes-gui-agent installed
+ok: qubes-core-agent-networking correctly absent
+ok: rootfs-resize + mount-dirs masked (and we booted fine)
+ok: qubes-sysinit + early-vm-config gated to Xen (skipped here)
+ok: virtio_blk reachable (builtin=1 initramfs=0)
+ok: qubes_cow_setup absent from initramfs (no gptfix/xvda boot wedge)
+ok: 'Proxmox Web GUI' .desktop present, valid, and launcher flags hardened
+ok: vmbr0 auto-net installed, Xen-gated (inactive here), generator validated
+ok: /etc/hostname is a Qubes protected file (agent skips the rename under Xen)
+ok: cron.service active (Qubes crond gate cleared)
+ok: pveproxy answers TLS on 127.0.0.1:8006 (HTTP 200); web UI reachable
+  ok /pve2/js/pvemanagerlib.js: HTTP 200, application/javascript, 2362136B
+  ok /proxmoxlib.js: HTTP 200, application/javascript, 833580B
+  ok /pve2/ext6/ext-all.js: HTTP 200, application/javascript, 2368586B
+ok: web UI bundles serve cleanly and PVE.StdWorkspace is bundled (no white-page fallback)
+ok: headless Chromium rendered the PVE UI (2951B DOM, login markup present)
+
+SMOKE PASS: Proxmox services-domain + Qubes integration validated.
+
+=== cleanup ===
+qemu-system-x86_64: terminating on signal 15 from pid 4155 (bash)

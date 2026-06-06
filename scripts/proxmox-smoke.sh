@@ -243,24 +243,34 @@ else
     echo "ok: qubes_cow_setup absent from initramfs (no gptfix/xvda boot wedge)"
   fi
 
-  # 5f. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it).
+  # 5f. The app-menu shortcut exists and is valid (qvm-sync-appmenus will see it),
+  # and it points at the SELF-HEALING wrapper -- not Chromium directly. The wrapper
+  # purges stale caches and waits for :8006 before opening the window, defusing the
+  # white-page (stale poisoned bundle) and startup-race failures seen on the live
+  # qube. We assert: (i) the .desktop is valid and Exec=the wrapper; (ii) the
+  # wrapper exists, is executable, parses as POSIX sh; (iii) it carries the load-
+  # bearing Chromium flags (--no-sandbox, --user-data-dir), the cache-purge, and
+  # the readiness wait; (iv) the no-op --ignore-certificate-errors hasn't returned.
   DESKTOP=/usr/share/applications/proxmox-web-gui.desktop
   [ -f "${DESKTOP}" ] || fail "missing ${DESKTOP}"
   desktop-file-validate "${DESKTOP}" \
     || fail "proxmox-web-gui.desktop is not a valid desktop entry"
-  # The launcher runs Chromium as root under a dummy framebuffer; these flags are
-  # load-bearing (see qubes-provision.sh). Assert the two that, if missing, leave
-  # the user with a window that never opens (--no-sandbox: root refuses to start)
-  # or a stale-cache white page (--user-data-dir: dedicated tmpfs-cached profile).
-  EXECLINE="$(grep -E '^Exec=' "${DESKTOP}" || true)"
-  printf '%s\n' "${EXECLINE}" | grep -q -- '--no-sandbox' \
-    || fail "launcher Exec missing --no-sandbox -- Chromium refuses to run as root, window never opens"
-  printf '%s\n' "${EXECLINE}" | grep -q -- '--user-data-dir=' \
-    || fail "launcher Exec missing --user-data-dir -- singleton/stale-cache wedge (white-page risk)"
-  # --ignore-certificate-errors is a no-op in --app mode; it must not have crept back.
-  printf '%s\n' "${EXECLINE}" | grep -q -- '--ignore-certificate-errors' \
-    && fail "launcher Exec still passes --ignore-certificate-errors -- no-op in --app mode, remove it"
-  echo "ok: 'Proxmox Web GUI' .desktop present, valid, and launcher flags hardened"
+  LAUNCHER=/usr/bin/proxmox-web-gui
+  grep -Eq "^Exec=${LAUNCHER}( |\$)" "${DESKTOP}" \
+    || fail ".desktop Exec does not invoke ${LAUNCHER} -- shortcut bypasses the self-healing wrapper"
+  [ -x "${LAUNCHER}" ] || fail "missing/!executable ${LAUNCHER} (self-healing web-UI launcher)"
+  sh -n "${LAUNCHER}" || fail "${LAUNCHER} is not valid POSIX sh"
+  grep -q -- '--no-sandbox' "${LAUNCHER}" \
+    || fail "${LAUNCHER} missing --no-sandbox -- Chromium refuses to run as root, window never opens"
+  grep -q -- '--user-data-dir=' "${LAUNCHER}" \
+    || fail "${LAUNCHER} missing --user-data-dir -- singleton/stale-cache wedge (white-page risk)"
+  grep -Eq 'rm -rf .*Cache|rm -rf .*CACHE' "${LAUNCHER}" \
+    || fail "${LAUNCHER} does not purge stale caches -- a poisoned bundle would persist (white page)"
+  grep -Eq 'http_code|401|200' "${LAUNCHER}" && grep -q 'sleep' "${LAUNCHER}" \
+    || fail "${LAUNCHER} has no readiness wait for :8006 -- the boot race could cache an error (white page)"
+  grep -q -- '--ignore-certificate-errors' "${LAUNCHER}" \
+    && fail "${LAUNCHER} still passes --ignore-certificate-errors -- no-op in --app mode, remove it"
+  echo "ok: 'Proxmox Web GUI' .desktop -> self-healing wrapper (cache-purge + :8006 readiness wait)"
 
   # 5g. QubesDB-driven vmbr0 auto-networking is installed, Xen-gated, and its
   # generator emits the canonical Qubes /32 route commands. The service itself
