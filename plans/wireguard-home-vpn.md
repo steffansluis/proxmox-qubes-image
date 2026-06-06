@@ -47,7 +47,8 @@ all of the above incl. "no baked/auto-generated key, no wg-genkey.service".
 ## personal qube (DONE locally, staged in `~/wg-personal/`)
 Keypair generated (X25519 via python `cryptography`, no wireguard-tools needed).
 - public key: `ef+C8AHn2fdy12GubVo6kPL0hKyTYAmj9OvR8L2AaAI=`
-- `wg0.conf` templated (needs the HA server pubkey + confirmed assigned IP).
+- `wg0.conf` complete: Address 172.27.66.3/24, [Peer] filled (server pubkey +
+  endpoint). Bring up with `wg-quick up /rw/config/wg0.conf` when roaming.
 
 ## What needs the user (token can't reach the Supervisor/add-on API — 401)
 HA add-on peer config lives behind the Supervisor API; the LLAT is Core-scope.
@@ -57,10 +58,10 @@ HA add-on peer config lives behind the Supervisor API; the LLAT is Core-scope.
      `addresses: [172.27.66.3]` ✅ added.
    - `proxmox` — `addresses: [172.27.66.4]` ✅ added, **pubkey still TODO**
      (run `wg-setup-key` on Proxmox after re-import, then paste the printed key).
-   - still need from add-on: the **server public key** + **port** (default 51820).
+   - server public key `Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM=`, port 51820
+     ✅ given — `[Peer]` blocks now filled in both wg0.confs.
 2. **Fritz!Box** → static route `172.27.66.0/24` via `192.168.178.38` (user: in progress).
 3. **AdGuard** → DNS rewrites `proxmox.home.arpa → 172.27.66.4` (+ services later).
-4. Fill `__HA_SERVER_PUBLIC_KEY__` / endpoint in both wg0.confs.
 
 ## Sequence
 1. CI green on the WG image → rebuild/pull v8-wg, dom0 re-import (stream over qrexec).

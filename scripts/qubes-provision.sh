@@ -736,9 +736,10 @@ echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-tes
 # placeholder wg0.conf (key = __WG_PRIVATE_KEY__), and a USER-RUN helper
 # /usr/sbin/wg-setup-key that the operator invokes ONCE post-deploy to generate
 # the keypair and splice the private key into wg0.conf. Nothing runs automatically:
-# wg-quick@wg0 is left DISABLED (a fresh image has no server pubkey/endpoint yet,
-# so auto-up would fail-loop). Post-deploy: run wg-setup-key, register the printed
-# public key as a peer in the HA add-on, fill the [Peer] block, enable the tunnel.
+# wg-quick@wg0 is left DISABLED until the host has its own private key. The [Peer]
+# block (HA add-on server pubkey + endpoint) IS pre-filled -- a WG public key is
+# not secret. Post-deploy: run wg-setup-key, register the printed public key as the
+# proxmox peer in the HA add-on, then `systemctl enable --now wg-quick@wg0`.
 say "4d/6 install WireGuard (peer identity for the home VPN; keys via wg-setup-key)"
 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" wireguard-tools \
   || fail "wireguard-tools install failed"
@@ -748,12 +749,12 @@ if dpkg -l wireguard-dkms 2>/dev/null | grep -q '^ii'; then
 fi
 
 install -d -m 0700 /etc/wireguard
-# Placeholder config (real key spliced in at first boot; [Peer] filled by user).
+# Config with the [Peer] pre-filled; only the host privkey is spliced post-deploy.
 cat >/etc/wireguard/wg0.conf <<'WGCONF'
 # Proxmox host WireGuard peer -- joins the Home Assistant WG add-on subnet.
 # Private key is generated post-deploy by `wg-setup-key` (never baked, never auto-run).
-# Before enabling: run /usr/sbin/wg-setup-key, register the printed public key as a
-# peer in the HA add-on, fill the [Peer] block below, `systemctl enable --now wg-quick@wg0`.
+# Before enabling: run /usr/sbin/wg-setup-key, register the printed public key as the
+# proxmox peer in the HA add-on, then `systemctl enable --now wg-quick@wg0`.
 [Interface]
 Address = 172.27.66.4/24
 PrivateKey = __WG_PRIVATE_KEY__
@@ -765,8 +766,8 @@ PostUp   = iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j
 PostDown = iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 [Peer]
-# Home Assistant WireGuard add-on (server/hub). FILL these post-deploy:
-PublicKey = __HA_SERVER_PUBLIC_KEY__
+# Home Assistant WireGuard add-on (server/hub). A WG *public* key is not secret.
+PublicKey = Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM=
 Endpoint = 192.168.178.38:51820
 AllowedIPs = 192.168.178.0/24, 172.27.66.0/24
 PersistentKeepalive = 25
