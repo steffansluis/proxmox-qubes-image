@@ -262,11 +262,14 @@ else
   for expect in \
     '+ ip addr add 10.137.0.99/32 dev vmbr0' \
     '+ ip route replace to unicast 10.138.23.60 dev vmbr0 scope link' \
-    '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink' \
-    '+ ip neigh replace to 10.138.23.60 dev vmbr0 lladdr fe:ff:ff:ff:ff:ff nud permanent'; do
+    '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink'; do
     printf '%s\n' "${NETCFG_OUT}" | grep -qF "${expect}" \
       || fail "qubes-vmbr0-netcfg dry-run missing expected command: ${expect}"
   done
+  # Regression guard: must NOT pin the gateway MAC. setup-ip does this for a PV
+  # vif, but on our bridged HVM it blackholes all gateway traffic (100% loss).
+  printf '%s\n' "${NETCFG_OUT}" | grep -q 'ip neigh' \
+    && fail "qubes-vmbr0-netcfg emits 'ip neigh' -- pins gateway MAC, blackholes bridged-HVM traffic"
   # And with NO IP it must be a clean no-op (qube without a netvm). Empty IP=""
   # falls through to qubesdb-read, which returns nothing under QEMU (no daemon).
   QUBES_NETCFG_DRY_RUN=1 IP="" GW="" DNS1="" DNS2="" "${NETCFG}" 2>&1 \

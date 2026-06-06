@@ -26,6 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast (before the ~5-min Packer build) on the one thing the QEMU
+      # smoke test structurally cannot check: that the Xen-gated vmbr0 auto-net
+      # script produces a WORKING network in the Qubes /32 model. This rebuilds
+      # that L2/L3 topology with veth + network namespaces (no Xen/dom0 needed)
+      # and actually pings across it, asserting the real script connects AND that
+      # the gateway-MAC-pin regression it guards against stays detectable.
+      - name: Test vmbr0 auto-networking (netns)
+        run: sudo bash scripts/test-netcfg-netns.sh
+
       # /dev/kvm makes the install ~5x faster but isn't guaranteed on hosted
       # runners. Enable it if present; the Packer build falls back to TCG
       # (accelerator=none) otherwise so the job never hard-depends on it.

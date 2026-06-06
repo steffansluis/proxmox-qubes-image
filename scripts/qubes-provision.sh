@@ -476,13 +476,20 @@ DNS2="$(qdb /qubes-secondary-dns "${DNS2:-}")"
 
 run() { if [ -n "$DRY_RUN" ]; then echo "+ $*"; else "$@"; fi; }
 
-# Point-to-point /32 model (mirrors setup-ip): replace the interface address
-# with our /32 (flushing the build-time placeholder the installer left), pin the
-# gateway MAC (anti-spoof), add a scope-link host route to the gateway (it sits
-# OUTSIDE our subnet), then the default route via it with onlink.
+# Point-to-point /32 model: replace the interface address with our /32 (flushing
+# the build-time placeholder the installer left), add a scope-link host route to
+# the gateway (it sits OUTSIDE our subnet), then the default route via it onlink.
+#
+# NOTE: deliberately NO static `ip neigh ... lladdr fe:ff:ff:ff:ff:ff permanent`.
+# qubes-core-agent's setup-ip pins that MAC because on a normal PV/PVH qube eth0
+# IS the paravirtual `vif` whose backend uses fe:ff:ff:ff:ff:ff. This is an HVM
+# whose emulated NIC is bridged into vmbr0, so the gateway is reached over real
+# Ethernet and its MAC must be learned by ARP -- pinning the vif MAC blackholes
+# all gateway traffic (100% packet loss, proven by a veth/netns repro + a live
+# qube). The working manual recipe for the bare image never set a neigh entry
+# either; let ARP resolve. (See netns test in scripts/test-netcfg-netns.sh.)
 run ip -4 addr flush dev "$IFACE"
 run ip addr add "${IP}/32" dev "$IFACE"
-run ip neigh replace to "$GW" dev "$IFACE" lladdr fe:ff:ff:ff:ff:ff nud permanent
 run ip route replace to unicast "$GW" dev "$IFACE" scope link
 run ip route replace to unicast default via "$GW" dev "$IFACE" onlink
 
@@ -539,11 +546,15 @@ NETCFG_OUT="$(QUBES_NETCFG_DRY_RUN=1 IP=10.137.0.99 GW=10.138.23.60 \
 for expect in \
   '+ ip addr add 10.137.0.99/32 dev vmbr0' \
   '+ ip route replace to unicast 10.138.23.60 dev vmbr0 scope link' \
-  '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink' \
-  '+ ip neigh replace to 10.138.23.60 dev vmbr0 lladdr fe:ff:ff:ff:ff:ff nud permanent'; do
+  '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink'; do
   printf '%s\n' "${NETCFG_OUT}" | grep -qF "${expect}" \
     || fail "qubes-vmbr0-netcfg dry-run missing expected command: ${expect}"
 done
+# Regression guard: the gateway-MAC pin (correct for a PV vif, fatal for our
+# bridged HVM) must NOT be emitted -- it blackholes all gateway traffic.
+if printf '%s\n' "${NETCFG_OUT}" | grep -q 'ip neigh'; then
+  fail "qubes-vmbr0-netcfg emits an 'ip neigh' entry -- pins gateway MAC, blackholes traffic on a bridged HVM"
+fi
 echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-test passed"
 
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
