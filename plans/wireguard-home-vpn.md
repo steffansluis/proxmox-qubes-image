@@ -89,7 +89,7 @@ Identified 2026-06-07 from the admin dump: DOCSIS 3.1, hw 1.2, fw
 LG/Compal **Ziggo Connect Box / SmartWifi modem** (RDK-B). The probe earlier
 (lighttpd + Vite/React SPA at :80, no TR-064) is this box's newer UI.
 
-**Two firmware limitations that shape the design:**
+**Firmware limitation that shapes the design:**
 1. **No static-route option.** Ziggo consumer fw exposes only DHCP, port-forward,
    MAC-filter (SmartWifi web). So we CANNOT push `172.27.66.0/24 via .38` at the
    router. Workarounds for "other LAN clients reach the tunnel":
@@ -98,19 +98,12 @@ LG/Compal **Ziggo Connect Box / SmartWifi modem** (RDK-B). The probe earlier
    - run those clients' own WG peer (the per-peer model already chosen); OR
    - reverse-proxy the tunnel services on HA itself (HA is already on the LAN).
    NONE of this blocks HA↔Proxmox or personal↔Proxmox (those ride WG directly).
-2. **CGNAT/DS-Lite on the IPv4 side** (Ziggo default). The public IPv4 is shared
-   at the carrier, so a port-forward of UDP 51820 on this modem will NOT make the
-   home reachable from the internet — the inbound packet never reaches the WAN.
-   This directly affects the ROAMING endpoint (`__HA_ENDPOINT__`). Options, best
-   first for this setup:
-   - **IPv6**: Ziggo gives a routable IPv6 prefix; if the HA box has a global IPv6
-     + the modem firewall allows UDP 51820 to it, use an AAAA-backed DDNS name as
-     the endpoint. Works only where the roaming client also has IPv6.
-   - **Ask Ziggo for IPv4-only** (free) → removes CGNAT → normal port-forward works.
-   - **VPS relay**: cheap public-IPv4 VPS runs WG; HA dials OUT to it; roaming
-     clients hit the VPS. Most robust, but adds a host to maintain.
-   At HOME none of this matters — personal↔Proxmox↔HA all work on the LAN/WG subnet
-   regardless of CGNAT. Roaming is the only thing that needs a reachable endpoint.
+2. **IPv4 inbound: WORKS.** Initially assumed CGNAT/DS-Lite (Ziggo default), but
+   the user confirmed 2026-06-07 that a port-forward of UDP 51820 → HA already
+   works from OUTSIDE the home network. So this line is NOT on CGNAT (public IPv4,
+   or Ziggo moved them to IPv4-only). The ROAMING endpoint (`__HA_ENDPOINT__`) is
+   therefore just `<home-public-IPv4-or-DDNS>:51820` — no IPv6/VPS-relay needed.
+   A DDNS name is still wise (Ziggo IPv4 can change); the port-forward stays.
 
 To open the modem: http://192.168.178.1, password on the sticker; advanced
 settings live under "SmartWifi web" (port-forward, DHCP) — confirm there's truly
