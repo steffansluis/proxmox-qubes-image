@@ -65,10 +65,11 @@ HA add-on peer config lives behind the Supervisor API; the LLAT is Core-scope.
      and the operator's address shouldn't ship in a public artifact. Both are
      spliced post-deploy by `wg-setup-key <SERVER_PUBKEY> <ENDPOINT>`.
 2. **Router static route** (gateway `192.168.178.1`) → `172.27.66.0/24` via
-   `192.168.178.38`. NOTE: the router is NOT a Fritz!Box (serves a Vite/React SPA,
-   lighttpd) — model TBD; see "Router" below. Needed so LAN clients other than HA
-   can reach the tunnel subnet. NOT required for HA↔Proxmox itself (HA is the WG
-   hub, already knows the route).
+   `192.168.178.38`. The router is a **Ziggo SmartWifi modem** (LG/Compal Connect
+   Box, RDK-B fw `LG-RDK_12.13.16`) — its consumer firmware does NOT expose static
+   routes (only DHCP, port-forward, MAC-filter). So this step is likely impossible
+   as-is; see "Router" below for the per-host route workaround. NOT required for
+   HA↔Proxmox itself (HA is the WG hub, already knows the route).
 3. **AdGuard** → DNS rewrites `proxmox.home.arpa → 172.27.66.4` (+ services later).
 
 ## Sequence
@@ -82,16 +83,38 @@ HA add-on peer config lives behind the Supervisor API; the LLAT is Core-scope.
    container-automation trial via the Proxmox API (`proxmoxer`).
 5. (Optional, for other LAN clients) router static route + AdGuard names above.
 
-## Router (gateway 192.168.178.1)
-NOT a Fritz!Box — probed 2026-06-06: lighttpd/1.4.67 serving a Vite/React SPA
-(`/vite.svg`, `/index.js`, `<div id="root">`), empty `<title>`, no `tr64desc.xml`
-on :49000, `jason_boxinfo.xml` returns the SPA. Could be a custom/OpenWrt-LuCI-
-replacement UI, a pfSense/OPNsense-style box, or an ISP unit with a React UI.
-To add the static route the user needs to ID it (browse to http://192.168.178.1,
-check the login/brand) — then: pfSense/OPNsense → System ▸ Routing ▸ Static
-Routes; OpenWrt → Network ▸ Routing ▸ Static IPv4; generic → look for
-"Static routes"/"LAN routes". Destination `172.27.66.0/24`, gateway
-`192.168.178.38`. Only needed for LAN clients beyond HA.
+## Router (gateway 192.168.178.1) = Ziggo SmartWifi modem
+Identified 2026-06-07 from the admin dump: DOCSIS 3.1, hw 1.2, fw
+`LG-RDK_12.13.16-2504.5`, MAC `2C:FB:0F:72:62:8D`, SN `YBES50874240` = the
+LG/Compal **Ziggo Connect Box / SmartWifi modem** (RDK-B). The probe earlier
+(lighttpd + Vite/React SPA at :80, no TR-064) is this box's newer UI.
+
+**Two firmware limitations that shape the design:**
+1. **No static-route option.** Ziggo consumer fw exposes only DHCP, port-forward,
+   MAC-filter (SmartWifi web). So we CANNOT push `172.27.66.0/24 via .38` at the
+   router. Workarounds for "other LAN clients reach the tunnel":
+   - per-host route on each client that needs it (`ip route add 172.27.66.0/24 via
+     192.168.178.38`) — fine for the few devices that care; OR
+   - run those clients' own WG peer (the per-peer model already chosen); OR
+   - reverse-proxy the tunnel services on HA itself (HA is already on the LAN).
+   NONE of this blocks HA↔Proxmox or personal↔Proxmox (those ride WG directly).
+2. **CGNAT/DS-Lite on the IPv4 side** (Ziggo default). The public IPv4 is shared
+   at the carrier, so a port-forward of UDP 51820 on this modem will NOT make the
+   home reachable from the internet — the inbound packet never reaches the WAN.
+   This directly affects the ROAMING endpoint (`__HA_ENDPOINT__`). Options, best
+   first for this setup:
+   - **IPv6**: Ziggo gives a routable IPv6 prefix; if the HA box has a global IPv6
+     + the modem firewall allows UDP 51820 to it, use an AAAA-backed DDNS name as
+     the endpoint. Works only where the roaming client also has IPv6.
+   - **Ask Ziggo for IPv4-only** (free) → removes CGNAT → normal port-forward works.
+   - **VPS relay**: cheap public-IPv4 VPS runs WG; HA dials OUT to it; roaming
+     clients hit the VPS. Most robust, but adds a host to maintain.
+   At HOME none of this matters — personal↔Proxmox↔HA all work on the LAN/WG subnet
+   regardless of CGNAT. Roaming is the only thing that needs a reachable endpoint.
+
+To open the modem: http://192.168.178.1, password on the sticker; advanced
+settings live under "SmartWifi web" (port-forward, DHCP) — confirm there's truly
+no route option before relying on the per-host workaround.
 
 ## Notes
 - HA Proxmox *integration* is monitor + power-toggle only (can't create
