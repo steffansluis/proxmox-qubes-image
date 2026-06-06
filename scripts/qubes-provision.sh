@@ -686,10 +686,29 @@ apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "${CHROMIUM_BIN}" ] || fail "no chromium binary found after install"
 
-# .desktop lives in /usr/share/applications so qubes.GetAppMenus enumerates it;
-# dom0's qvm-sync-appmenus then rewrites Exec to qubes.StartApp+proxmox-web-gui.
-# Name uses only ASCII/-/space (passes desktop-file-validate). The --app window
-# is a single-purpose kiosk-ish window pointed at the local web UI over HTTPS.
+# The Exec line runs Chromium as ROOT (Proxmox is all-root) under qubes-gui-
+# agent's DUMMY framebuffer X server (no GPU). Each flag is load-bearing:
+#  --no-sandbox        Chromium HARD-REFUSES to start as root without this
+#                      (crbug.com/638180); the old launcher only "worked" because
+#                      ... it didn't, as root -- this is mandatory, not optional.
+#  --user-data-dir     a dedicated, stable profile. Avoids the SingletonLock/stale
+#                      -cache wedge: the web UI showed a white page (500 on
+#                      /PVE/StdWorkspace.js -- ExtJS's loader fallback when an
+#                      earlier cached/partial pvemanagerlib.js threw) after the
+#                      browser cached errors during the pre-fix ERR_TIMED_OUT era.
+#  --disk-cache-dir=/tmp/... + --disk-cache-size=1  keep the HTTP cache tiny and
+#                      on tmpfs so a stale bundle can never persist across boots.
+#  --disable-gpu       the dummy framebuffer has no GPU; GPU/compositing init
+#                      otherwise stalls or blanks the window.
+#  --disable-dev-shm-usage   small /dev/shm -> renderer crash without this.
+#  --password-store=basic + --disable-features=Translate   no gnome-keyring/extra
+#                      D-Bus deps on a headless host.
+#  --no-first-run --no-default-browser-check   skip dialogs that can swallow --app.
+#  --test-type         suppress the unsupported-flags infobar.
+# NOTE: --ignore-certificate-errors was REMOVED -- Chromium ignores it in --app
+# mode and prints a warning bar; the self-signed PVE cert still loads the page
+# (only a cosmetic NET::ERR warning that --app dismisses), and StdWorkspace is
+# served fine over it. Kept simple: we do not bypass TLS, we just open the UI.
 install -d -m 0755 /usr/share/applications
 cat >/usr/share/applications/proxmox-web-gui.desktop <<EOF
 [Desktop Entry]
@@ -698,7 +717,7 @@ Version=1.0
 Name=Proxmox Web GUI
 GenericName=Proxmox VE Management
 Comment=Open the Proxmox VE web interface
-Exec=${CHROMIUM_BIN} --app=https://localhost:8006 --ignore-certificate-errors
+Exec=${CHROMIUM_BIN} --app=https://localhost:8006 --no-sandbox --user-data-dir=/root/.config/proxmox-web-gui --disk-cache-dir=/tmp/proxmox-web-gui-cache --disk-cache-size=1 --disable-gpu --disable-dev-shm-usage --password-store=basic --disable-features=Translate --no-first-run --no-default-browser-check --test-type
 Icon=proxmox-ve
 Terminal=false
 Categories=Network;

@@ -248,7 +248,19 @@ else
   [ -f "${DESKTOP}" ] || fail "missing ${DESKTOP}"
   desktop-file-validate "${DESKTOP}" \
     || fail "proxmox-web-gui.desktop is not a valid desktop entry"
-  echo "ok: 'Proxmox Web GUI' .desktop present and valid"
+  # The launcher runs Chromium as root under a dummy framebuffer; these flags are
+  # load-bearing (see qubes-provision.sh). Assert the two that, if missing, leave
+  # the user with a window that never opens (--no-sandbox: root refuses to start)
+  # or a stale-cache white page (--user-data-dir: dedicated tmpfs-cached profile).
+  EXECLINE="$(grep -E '^Exec=' "${DESKTOP}" || true)"
+  printf '%s\n' "${EXECLINE}" | grep -q -- '--no-sandbox' \
+    || fail "launcher Exec missing --no-sandbox -- Chromium refuses to run as root, window never opens"
+  printf '%s\n' "${EXECLINE}" | grep -q -- '--user-data-dir=' \
+    || fail "launcher Exec missing --user-data-dir -- singleton/stale-cache wedge (white-page risk)"
+  # --ignore-certificate-errors is a no-op in --app mode; it must not have crept back.
+  printf '%s\n' "${EXECLINE}" | grep -q -- '--ignore-certificate-errors' \
+    && fail "launcher Exec still passes --ignore-certificate-errors -- no-op in --app mode, remove it"
+  echo "ok: 'Proxmox Web GUI' .desktop present, valid, and launcher flags hardened"
 
   # 5g. QubesDB-driven vmbr0 auto-networking is installed, Xen-gated, and its
   # generator emits the canonical Qubes /32 route commands. The service itself
@@ -339,6 +351,79 @@ else
     *)
       echo "ok: pveproxy answers on 127.0.0.1:8006 (HTTP ${HTTP_CODE})" ;;
   esac
+
+  # 5h3. The web UI must actually RENDER, not just answer on /. A blank/white page
+  # with a 500 on /PVE/StdWorkspace.js is ExtJS's class-loader fallback firing
+  # because an earlier JS bundle (pvemanagerlib.js / proxmoxlib.js) failed to
+  # load or was served truncated. The previous check only fetched index.html and
+  # would PASS on a white-page install. Fetch the real bundles the page <script>s
+  # and assert each serves 200, a JavaScript content-type, and a non-trivial size
+  # -- the regression guard for "UI loads blank". Also assert the loader-fallback
+  # path is NOT how StdWorkspace is served (a healthy prod build bundles it).
+  ui_ok=1
+  for spec in \
+    "/pve2/js/pvemanagerlib.js:1000000" \
+    "/proxmoxlib.js:300000" \
+    "/pve2/ext6/ext-all.js:500000"; do
+    url="${spec%%:*}"; min="${spec##*:}"
+    read -r code ctype size <<EOF2
+$(curl -sk --max-time 20 -o /dev/null -w '%{http_code} %{content_type} %{size_download}' "https://127.0.0.1:8006${url}" 2>/dev/null || echo "000 - 0")
+EOF2
+    if [ "${code}" != "200" ]; then
+      echo "  FAIL ${url}: HTTP ${code} (expected 200)"; ui_ok=0; continue
+    fi
+    case "${ctype}" in
+      *javascript*|*ecmascript*) : ;;
+      *) echo "  FAIL ${url}: content-type '${ctype}' is not JavaScript"; ui_ok=0; continue ;;
+    esac
+    if [ "${size:-0}" -lt "${min}" ]; then
+      echo "  FAIL ${url}: ${size}B < ${min}B (truncated bundle -> white page)"; ui_ok=0; continue
+    fi
+    echo "  ok ${url}: HTTP 200, ${ctype}, ${size}B"
+  done
+  [ "${ui_ok}" = "1" ] \
+    || fail "web UI JS bundles did not serve cleanly -- the page would render BLANK (StdWorkspace.js 500 class of bug)"
+  # The class PVE.StdWorkspace must live INSIDE pvemanagerlib.js (prod bundle), so
+  # the browser never falls back to GET /PVE/StdWorkspace.js. Verify it's bundled.
+  curl -sk --max-time 20 "https://127.0.0.1:8006/pve2/js/pvemanagerlib.js" 2>/dev/null \
+    | grep -q "PVE.StdWorkspace" \
+    || fail "pvemanagerlib.js does not define PVE.StdWorkspace -- browser would 500 on /PVE/StdWorkspace.js (white page)"
+  echo "ok: web UI bundles serve cleanly and PVE.StdWorkspace is bundled (no white-page fallback)"
+
+  # 5h4. END-TO-END RENDER: actually load the page in the SAME Chromium that ships
+  # in the image (148, baked for the launcher) and prove ExtJS builds the real UI
+  # instead of a blank <body>. The HTTP/bundle checks above prove the server side;
+  # this proves the client side -- it is the only check that reproduces the user's
+  # white-page symptom (a runtime JS exception serves fine over HTTP but renders
+  # nothing). --dump-dom prints the DOM *after* scripts run, so a white page yields
+  # an empty body and a healthy page yields ExtJS-generated markup + login text.
+  # If this passes in CI but the user still sees a white page on the live Xen qube,
+  # that itself localizes the bug to the runtime environment (e.g. hostname/pmxcfs
+  # state) rather than the baked image. Best-effort on tooling, hard on the verdict.
+  CHROME="$(command -v chromium || command -v chromium-browser || true)"
+  if [ -n "${CHROME}" ]; then
+    RDOM=/tmp/pve-render-dom.html
+    # --virtual-time-budget lets ExtJS finish its async class load + layout before
+    # the DOM is serialized; --ignore-certificate-errors is honoured in headless
+    # (unlike --app mode) so the self-signed cert doesn't abort the navigation.
+    timeout 60 "${CHROME}" --headless=new --no-sandbox --disable-gpu \
+      --disable-dev-shm-usage --ignore-certificate-errors \
+      --virtual-time-budget=20000 \
+      --user-data-dir=/tmp/pve-render-profile \
+      --dump-dom "https://127.0.0.1:8006" >"${RDOM}" 2>/tmp/pve-render.log || true
+    dom_bytes=$(wc -c <"${RDOM}" 2>/dev/null || echo 0)
+    # A rendered PVE login page contains the product string and ExtJS form markup.
+    # A white page is a near-empty <body> with none of these.
+    if grep -qiE 'Proxmox VE Login|pve-login|x-form-item|Ext\.' "${RDOM}" 2>/dev/null; then
+      echo "ok: headless Chromium rendered the PVE UI (${dom_bytes}B DOM, login markup present)"
+    else
+      echo "---- rendered DOM (first 60 lines) ----"; head -n 60 "${RDOM}" 2>/dev/null || true
+      echo "---- chromium stderr (last 40 lines) ----"; tail -n 40 /tmp/pve-render.log 2>/dev/null || true
+      fail "headless Chromium produced a BLANK page (${dom_bytes}B DOM, no PVE login markup) -- reproduces the white-page bug in CI"
+    fi
+  else
+    echo "warn: no chromium binary in smoke env -- skipped end-to-end render check"
+  fi
 fi
 
 # Teardown is handled by the EXIT trap (cleanup) so it runs on pass, fail, or

@@ -9,6 +9,11 @@ on:
         description: "Proxmox VE ISO version (e.g. 9.2-1)"
         required: true
         default: "9.2-1"
+      debug_on_failure:
+        description: "On provision/smoke failure, open a tmate SSH session into the live runner (the guest is still booted) instead of ending the job"
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -190,6 +195,24 @@ jobs:
             smoke-boot-serial.log
           if-no-files-found: warn
           retention-days: 14
+
+      # Interactive break-glass debugging. When a run is dispatched with
+      # debug_on_failure=true AND an earlier step failed, pause the job and open a
+      # tmate-backed SSH session into the live runner instead of letting it end.
+      # The built image is still on disk at output-proxmox/proxmox-ve.qcow2, so
+      # you can boot it by hand (qemu-system-x86_64 ... -nographic), re-run
+      # `scripts/proxmox-smoke.sh` or `scripts/smoke-test.sh`, or mount it with
+      # qemu-nbd to inspect the failing config -- collapsing the edit/push/wait
+      # cycle to seconds. Connect using the SSH command tmate prints in the step
+      # log. The session (and the job) ends when you `touch /continue` or hit the
+      # tmate timeout. Skipped entirely on normal/green runs -- it never costs
+      # runner minutes unless you both opt in and something actually broke.
+      - name: Debug over SSH (tmate) on failure
+        if: ${{ failure() && github.event.inputs.debug_on_failure == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          detached: false
 
       # Refuse to publish an image that wasn't provisioned + smoke-tested. Both
       # of those stages require KVM; without it we'd otherwise ship a bare,
