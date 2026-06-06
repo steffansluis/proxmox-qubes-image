@@ -505,14 +505,19 @@ HTML
 
   # 5h4. END-TO-END RENDER: load the page in the baked Chromium and prove ExtJS
   # actually BUILT the UI. CRITICAL: assert on markup that only appears in the
-  # ExtJS-GENERATED DOM (x-viewport / the login window), NOT on `Ext.` -- which is
-  # literally in the static inline <script> of index.html and is therefore present
-  # even on a fully blank/white page. (That false-positive is exactly why an
-  # earlier version of this check passed while the live UI was white.) A real
-  # render injects Ext's component DOM into <body>; a white page leaves <body>
-  # holding only the static history-form. We require a generated-DOM marker AND a
-  # non-trivial <body>, and we explicitly fail if any /PVE/StdWorkspace.js request
-  # would be needed (the loader-fallback signature).
+  # ExtJS-GENERATED DOM, NOT on `Ext.` -- which is literally in the static inline
+  # <script> of index.html and is therefore present even on a fully blank/white
+  # page. (That false-positive is exactly why an earlier version of this check
+  # passed while the live UI was white.)
+  #
+  # The DEFINITIVE proof is `pveStdWorkspace`: ExtJS stamps the StdWorkspace
+  # component's itemId onto the DOM (data-componentid="pveStdWorkspace-NNNN") only
+  # after PVE.StdWorkspace successfully instantiates -- the exact step that fails
+  # in the white-page bug (where the loader instead 500s on /PVE/StdWorkspace.js).
+  # We also require `x-viewport` (the root container ExtJS injects on <html>) and a
+  # non-trivial total DOM. The earlier `body_after_form` heuristic was WRONG: PVE's
+  # <form id="history-form"> is the LAST element in <body>, so "everything after
+  # </form>" is ~empty even on a perfect render -> a false BLANK-page failure.
   if [ -n "${CHROME}" ]; then
     RDOM=/tmp/pve-render-dom.html
     timeout 60 "${CHROME}" --headless=new --no-sandbox --disable-gpu \
@@ -521,15 +526,14 @@ HTML
       --user-data-dir=/tmp/pve-render-profile \
       --dump-dom "https://127.0.0.1:8006" >"${RDOM}" 2>/tmp/pve-render.log || true
     dom_bytes=$(wc -c <"${RDOM}" 2>/dev/null || echo 0)
-    # Body content after the static history-form = what ExtJS generated.
-    body_after_form="$(sed -n 's/.*<\/form>//p' "${RDOM}" 2>/dev/null | tr -d ' \n\t')"
-    if grep -qE 'x-viewport|Proxmox VE Login|x-form-type-text|pve-login|x-mask' "${RDOM}" 2>/dev/null \
-       && [ "${#body_after_form}" -gt 200 ]; then
-      echo "ok: headless Chromium rendered the PVE UI (${dom_bytes}B DOM, ExtJS-generated markup present)"
+    if grep -q 'pveStdWorkspace' "${RDOM}" 2>/dev/null \
+       && grep -q 'x-viewport' "${RDOM}" 2>/dev/null \
+       && [ "${dom_bytes}" -gt 10000 ]; then
+      echo "ok: headless Chromium rendered the PVE UI (${dom_bytes}B DOM, PVE.StdWorkspace instantiated)"
     else
       echo "---- rendered DOM (first 80 lines) ----"; head -n 80 "${RDOM}" 2>/dev/null || true
       echo "---- chromium stderr (last 40 lines) ----"; tail -n 40 /tmp/pve-render.log 2>/dev/null || true
-      fail "headless Chromium produced a BLANK page (${dom_bytes}B DOM, no ExtJS-generated markup) -- the white-page bug"
+      fail "headless Chromium produced a BLANK page (${dom_bytes}B DOM, no pveStdWorkspace/x-viewport) -- the white-page bug"
     fi
   else
     echo "warn: no chromium binary in smoke env -- skipped end-to-end render check"
