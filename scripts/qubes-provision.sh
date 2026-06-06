@@ -430,8 +430,13 @@ echo "ok: boot config targets pve-root (no stray root=dmroot)"
 # relies on is left exactly as built -- zero regression risk. CI validates the
 # GENERATOR LOGIC instead, by running the script in DRY_RUN with injected values.
 say "4c/6 install QubesDB-driven vmbr0 auto-networking (Xen-gated)"
-install -d -m 0755 /usr/local/sbin
-cat >/usr/local/sbin/qubes-vmbr0-netcfg <<'NETCFG'
+# Install into /usr/sbin, NOT /usr/local/sbin: qubes-core-agent turns /usr/local
+# into a persistent per-VM bind-mount from /rw/usrlocal (and seeds it from
+# /usr/local.orig), so anything baked under /usr/local on the read-only root is
+# SHADOWED on the next boot -- the file passes the provision self-test but
+# vanishes by the smoke boot. /usr/sbin is part of the immutable root (never a
+# Qubes bind target) and is the correct FHS home for an OS-shipped admin script.
+cat >/usr/sbin/qubes-vmbr0-netcfg <<'NETCFG'
 #!/bin/sh
 # Apply Qubes-assigned networking to the Proxmox vmbr0 bridge.
 #
@@ -496,7 +501,7 @@ fi
 
 log "applied ${IP}/32 gw ${GW} on ${IFACE}"
 NETCFG
-chmod 0755 /usr/local/sbin/qubes-vmbr0-netcfg
+chmod 0755 /usr/sbin/qubes-vmbr0-netcfg
 
 cat >/etc/systemd/system/qubes-vmbr0-netcfg.service <<'UNIT'
 [Unit]
@@ -514,7 +519,7 @@ Before=pveproxy.service pve-guests.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/qubes-vmbr0-netcfg
+ExecStart=/usr/sbin/qubes-vmbr0-netcfg
 
 [Install]
 WantedBy=multi-user.target
@@ -526,10 +531,10 @@ systemctl enable qubes-vmbr0-netcfg.service \
 # idle): assert no syntax errors, then inject fake dom0-assigned values + DRY_RUN
 # and require it to emit the canonical setup-ip route commands. Catches a broken
 # generator BEFORE publish -- the same path CI's smoke stage re-checks.
-sh -n /usr/local/sbin/qubes-vmbr0-netcfg \
+sh -n /usr/sbin/qubes-vmbr0-netcfg \
   || fail "qubes-vmbr0-netcfg has a shell syntax error"
 NETCFG_OUT="$(QUBES_NETCFG_DRY_RUN=1 IP=10.137.0.99 GW=10.138.23.60 \
-  DNS1=10.139.1.1 DNS2=10.139.1.2 /usr/local/sbin/qubes-vmbr0-netcfg 2>&1)" \
+  DNS1=10.139.1.1 DNS2=10.139.1.2 /usr/sbin/qubes-vmbr0-netcfg 2>&1)" \
   || fail "qubes-vmbr0-netcfg dry-run exited non-zero"
 for expect in \
   '+ ip addr add 10.137.0.99/32 dev vmbr0' \

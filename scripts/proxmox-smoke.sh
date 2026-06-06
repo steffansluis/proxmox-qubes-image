@@ -242,7 +242,10 @@ else
   # stages 2-4 exercised. We can't read real QubesDB under QEMU, so we re-run the
   # generator in DRY_RUN with injected values and assert the setup-ip-equivalent
   # output (same self-test qubes-provision.sh runs at bake, re-checked here).
-  NETCFG=/usr/local/sbin/qubes-vmbr0-netcfg
+  # In /usr/sbin, not /usr/local/sbin: qubes-core-agent bind-mounts /usr/local
+  # from persistent /rw/usrlocal, which would shadow a baked-in /usr/local file
+  # by the next boot. /usr/sbin is on the immutable root.
+  NETCFG=/usr/sbin/qubes-vmbr0-netcfg
   [ -x "${NETCFG}" ] || fail "missing ${NETCFG} (vmbr0 auto-net generator)"
   UNITFILE=/etc/systemd/system/qubes-vmbr0-netcfg.service
   [ -f "${UNITFILE}" ] || fail "missing ${UNITFILE}"
