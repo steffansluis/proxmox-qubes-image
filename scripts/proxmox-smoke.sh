@@ -235,6 +235,41 @@ else
   desktop-file-validate "${DESKTOP}" \
     || fail "proxmox-web-gui.desktop is not a valid desktop entry"
   echo "ok: 'Proxmox Web GUI' .desktop present and valid"
+
+  # 5g. QubesDB-driven vmbr0 auto-networking is installed, Xen-gated, and its
+  # generator emits the canonical Qubes /32 route commands. The service itself
+  # must be INACTIVE here (no Xen) -- proving it never touches the vmbr0 that
+  # stages 2-4 exercised. We can't read real QubesDB under QEMU, so we re-run the
+  # generator in DRY_RUN with injected values and assert the setup-ip-equivalent
+  # output (same self-test qubes-provision.sh runs at bake, re-checked here).
+  NETCFG=/usr/local/sbin/qubes-vmbr0-netcfg
+  [ -x "${NETCFG}" ] || fail "missing ${NETCFG} (vmbr0 auto-net generator)"
+  UNITFILE=/etc/systemd/system/qubes-vmbr0-netcfg.service
+  [ -f "${UNITFILE}" ] || fail "missing ${UNITFILE}"
+  grep -q 'ConditionVirtualization=xen' "${UNITFILE}" \
+    || fail "qubes-vmbr0-netcfg.service is not gated on ConditionVirtualization=xen"
+  [ "$(systemctl is-enabled qubes-vmbr0-netcfg.service 2>/dev/null)" = "enabled" ] \
+    || fail "qubes-vmbr0-netcfg.service not enabled (won't auto-net under Xen)"
+  # Under this QEMU boot (no Xen) the condition must NOT be met -> not active.
+  [ "$(systemctl is-active qubes-vmbr0-netcfg.service 2>/dev/null)" != "active" ] \
+    || fail "qubes-vmbr0-netcfg.service active under QEMU -- Xen gate failed, would maul vmbr0"
+  NETCFG_OUT="$(QUBES_NETCFG_DRY_RUN=1 IP=10.137.0.99 GW=10.138.23.60 \
+    DNS1=10.139.1.1 DNS2=10.139.1.2 "${NETCFG}" 2>&1)" \
+    || fail "qubes-vmbr0-netcfg dry-run exited non-zero"
+  for expect in \
+    '+ ip addr add 10.137.0.99/32 dev vmbr0' \
+    '+ ip route replace to unicast 10.138.23.60 dev vmbr0 scope link' \
+    '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink' \
+    '+ ip neigh replace to 10.138.23.60 dev vmbr0 lladdr fe:ff:ff:ff:ff:ff nud permanent'; do
+    printf '%s\n' "${NETCFG_OUT}" | grep -qF "${expect}" \
+      || fail "qubes-vmbr0-netcfg dry-run missing expected command: ${expect}"
+  done
+  # And with NO IP it must be a clean no-op (qube without a netvm). Empty IP=""
+  # falls through to qubesdb-read, which returns nothing under QEMU (no daemon).
+  QUBES_NETCFG_DRY_RUN=1 IP="" GW="" DNS1="" DNS2="" "${NETCFG}" 2>&1 \
+    | grep -q 'no /qubes-ip' \
+    || fail "qubes-vmbr0-netcfg did not no-op cleanly when no IP is assigned"
+  echo "ok: vmbr0 auto-net installed, Xen-gated (inactive here), generator validated"
 fi
 
 # Teardown is handled by the EXIT trap (cleanup) so it runs on pass, fail, or

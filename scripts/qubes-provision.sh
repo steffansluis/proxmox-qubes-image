@@ -412,6 +412,135 @@ for cfg in /boot/grub/grub.cfg /boot/efi/EFI/proxmox/*/grub.cfg /etc/kernel/cmdl
 done
 echo "ok: boot config targets pve-root (no stray root=dmroot)"
 
+# --- 4c. Qubes auto-networking for vmbr0 (QubesDB-driven) -------------------
+# Goal: the qube auto-configures its IP/gateway/DNS like any other Qubes VM,
+# WITHOUT qubes-core-agent-networking (which configures the RAW NIC the Qubes /32
+# way and drags NetworkManager in -- both destroy Proxmox's vmbr0 bridge, the
+# seam LXC + the firewall hole hang off). The trick: QubesDB is served over
+# XenBus, NOT the network, so we read the dom0-assigned addressing with
+# qubesdb-read and apply it OURSELVES to the vmbr0 BRIDGE -- keeping Proxmox's
+# model (enslaved NIC + container ports) while gaining auto-addressing. Same
+# pattern as qubes-mirage-firewall and Windows QWT (read QubesDB at boot, keep
+# own net stack); the route logic is a faithful copy of qubes-core-agent's
+# network/setup-ip (point-to-point /32: scope-link host route to the gateway +
+# onlink default + permanent gateway-MAC neigh).
+#
+# Xen-gated (ConditionVirtualization=xen) so it ONLY runs under real Qubes/Xen.
+# Under plain QEMU (CI smoke) it never fires, so the vmbr0 that CI's NAT-out
+# relies on is left exactly as built -- zero regression risk. CI validates the
+# GENERATOR LOGIC instead, by running the script in DRY_RUN with injected values.
+say "4c/6 install QubesDB-driven vmbr0 auto-networking (Xen-gated)"
+install -d -m 0755 /usr/local/sbin
+cat >/usr/local/sbin/qubes-vmbr0-netcfg <<'NETCFG'
+#!/bin/sh
+# Apply Qubes-assigned networking to the Proxmox vmbr0 bridge.
+#
+# Reads IP/gateway/DNS from QubesDB (XenBus -- needs no network) and applies the
+# Qubes point-to-point /32 model to vmbr0, faithfully following the route logic
+# in qubes-core-agent network/setup-ip. Installed by qubes-provision.sh and run
+# at boot by qubes-vmbr0-netcfg.service (which is ConditionVirtualization=xen).
+#
+# Manual override / escape hatch: kernelopts is NOT delivered to a kernel=''
+# StandaloneVM (it boots its own kernel via GRUB, so dom0 never sets the kernel
+# cmdline), so the override lives in a FILE -- /etc/default/qubes-vmbr0-netcfg --
+# which may set IP/GW/DNS1/DNS2 (and IFACE). CI injects the same vars + DRY_RUN
+# to exercise the generator without a Xen backend.
+set -eu
+
+IFACE="${IFACE:-vmbr0}"
+DRY_RUN="${QUBES_NETCFG_DRY_RUN:-}"
+
+log() { echo "qubes-vmbr0-netcfg: $*"; }
+
+# In-guest manual override / CI injection point (may set IP/GW/DNS1/DNS2/IFACE).
+[ -r /etc/default/qubes-vmbr0-netcfg ] && . /etc/default/qubes-vmbr0-netcfg
+
+# Value resolution: an explicit env/override value wins, else read from QubesDB.
+qdb() { # <qubesdb-key> <current-value>
+  if [ -n "$2" ]; then printf '%s' "$2"; return 0; fi
+  qubesdb-read "$1" 2>/dev/null || true
+}
+IP="$(qdb /qubes-ip "${IP:-}")"
+GW="$(qdb /qubes-gateway "${GW:-}")"
+DNS1="$(qdb /qubes-primary-dns "${DNS1:-}")"
+DNS2="$(qdb /qubes-secondary-dns "${DNS2:-}")"
+
+# No /qubes-ip => the qube has no netvm; leave Proxmox's own config untouched.
+[ -n "$IP" ] || { log "no /qubes-ip (no netvm?) -- leaving ${IFACE} unchanged"; exit 0; }
+[ -n "$GW" ] || { log "have IP ${IP} but no /qubes-gateway -- refusing partial config"; exit 1; }
+
+run() { if [ -n "$DRY_RUN" ]; then echo "+ $*"; else "$@"; fi; }
+
+# Point-to-point /32 model (mirrors setup-ip): replace the interface address
+# with our /32 (flushing the build-time placeholder the installer left), pin the
+# gateway MAC (anti-spoof), add a scope-link host route to the gateway (it sits
+# OUTSIDE our subnet), then the default route via it with onlink.
+run ip -4 addr flush dev "$IFACE"
+run ip addr add "${IP}/32" dev "$IFACE"
+run ip neigh replace to "$GW" dev "$IFACE" lladdr fe:ff:ff:ff:ff:ff nud permanent
+run ip route replace to unicast "$GW" dev "$IFACE" scope link
+run ip route replace to unicast default via "$GW" dev "$IFACE" onlink
+
+# DNS: Qubes hands out placeholder resolvers that the netvm DNATs upstream.
+if [ -n "$DNS1" ]; then
+  RESOLV="# written by qubes-vmbr0-netcfg (Qubes-assigned resolvers)
+nameserver $DNS1"
+  [ -n "$DNS2" ] && RESOLV="$RESOLV
+nameserver $DNS2"
+  if [ -n "$DRY_RUN" ]; then
+    echo "+ write /etc/resolv.conf: nameserver $DNS1${DNS2:+, $DNS2}"
+  else
+    printf '%s\n' "$RESOLV" >/etc/resolv.conf
+  fi
+fi
+
+log "applied ${IP}/32 gw ${GW} on ${IFACE}"
+NETCFG
+chmod 0755 /usr/local/sbin/qubes-vmbr0-netcfg
+
+cat >/etc/systemd/system/qubes-vmbr0-netcfg.service <<'UNIT'
+[Unit]
+Description=Apply Qubes-assigned networking to the Proxmox vmbr0 bridge
+Documentation=https://github.com/steffansluis/proxmox-qubes-image
+# Only under real Xen (a Qubes domU). Under plain QEMU (CI) this never runs, so
+# the vmbr0 the smoke test's NAT-out depends on is left exactly as built.
+ConditionVirtualization=xen
+# vmbr0 must exist (ifupdown2) and qubesdb must be up (it serves our addresses).
+After=networking.service qubes-db.service qubes-sysinit.service
+Wants=qubes-db.service
+# Be addressed before the web UI + guests come up so they bind the right IP.
+Before=pveproxy.service pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/qubes-vmbr0-netcfg
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable qubes-vmbr0-netcfg.service \
+  || fail "could not enable qubes-vmbr0-netcfg.service"
+
+# Self-test the generator at bake time (no Xen here, so the service itself stays
+# idle): assert no syntax errors, then inject fake dom0-assigned values + DRY_RUN
+# and require it to emit the canonical setup-ip route commands. Catches a broken
+# generator BEFORE publish -- the same path CI's smoke stage re-checks.
+sh -n /usr/local/sbin/qubes-vmbr0-netcfg \
+  || fail "qubes-vmbr0-netcfg has a shell syntax error"
+NETCFG_OUT="$(QUBES_NETCFG_DRY_RUN=1 IP=10.137.0.99 GW=10.138.23.60 \
+  DNS1=10.139.1.1 DNS2=10.139.1.2 /usr/local/sbin/qubes-vmbr0-netcfg 2>&1)" \
+  || fail "qubes-vmbr0-netcfg dry-run exited non-zero"
+for expect in \
+  '+ ip addr add 10.137.0.99/32 dev vmbr0' \
+  '+ ip route replace to unicast 10.138.23.60 dev vmbr0 scope link' \
+  '+ ip route replace to unicast default via 10.138.23.60 dev vmbr0 onlink' \
+  '+ ip neigh replace to 10.138.23.60 dev vmbr0 lladdr fe:ff:ff:ff:ff:ff nud permanent'; do
+  printf '%s\n' "${NETCFG_OUT}" | grep -qF "${expect}" \
+    || fail "qubes-vmbr0-netcfg dry-run missing expected command: ${expect}"
+done
+echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-test passed"
+
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
 # Chromium --app window, which the dom0 WM decorates like any native app window.
