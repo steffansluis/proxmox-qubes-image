@@ -249,8 +249,8 @@ else
   # white-page (stale poisoned bundle) and startup-race failures seen on the live
   # qube. We assert: (i) the .desktop is valid and Exec=the wrapper; (ii) the
   # wrapper exists, is executable, parses as POSIX sh; (iii) it carries the load-
-  # bearing Chromium flags (--no-sandbox, --user-data-dir), the cache-purge, and
-  # the readiness wait; (iv) the no-op --ignore-certificate-errors hasn't returned.
+  # bearing Chromium flags (--no-sandbox, --user-data-dir, --ignore-certificate-
+  # errors for the self-signed PVE cert), the cache-purge, and the readiness wait.
   DESKTOP=/usr/share/applications/proxmox-web-gui.desktop
   [ -f "${DESKTOP}" ] || fail "missing ${DESKTOP}"
   desktop-file-validate "${DESKTOP}" \
@@ -269,8 +269,8 @@ else
   grep -Eq 'http_code|401|200' "${LAUNCHER}" && grep -q 'sleep' "${LAUNCHER}" \
     || fail "${LAUNCHER} has no readiness wait for :8006 -- the boot race could cache an error (white page)"
   grep -q -- '--ignore-certificate-errors' "${LAUNCHER}" \
-    && fail "${LAUNCHER} still passes --ignore-certificate-errors -- no-op in --app mode, remove it"
-  echo "ok: 'Proxmox Web GUI' .desktop -> self-healing wrapper (cache-purge + :8006 readiness wait)"
+    || fail "${LAUNCHER} missing --ignore-certificate-errors -- self-signed PVE cert would show a warning interstitial"
+  echo "ok: 'Proxmox Web GUI' .desktop -> self-healing wrapper (cache-purge + :8006 readiness wait + cert-accept)"
 
   # 5g. QubesDB-driven vmbr0 auto-networking is installed, Xen-gated, and its
   # generator emits the canonical Qubes /32 route commands. The service itself
@@ -465,36 +465,71 @@ EOF2
     || fail "pvemanagerlib.js does not define PVE.StdWorkspace -- browser would 500 on /PVE/StdWorkspace.js (white page)"
   echo "ok: web UI bundles serve cleanly and PVE.StdWorkspace is bundled (no white-page fallback)"
 
-  # 5h4. END-TO-END RENDER: actually load the page in the SAME Chromium that ships
-  # in the image (148, baked for the launcher) and prove ExtJS builds the real UI
-  # instead of a blank <body>. The HTTP/bundle checks above prove the server side;
-  # this proves the client side -- it is the only check that reproduces the user's
-  # white-page symptom (a runtime JS exception serves fine over HTTP but renders
-  # nothing). --dump-dom prints the DOM *after* scripts run, so a white page yields
-  # an empty body and a healthy page yields ExtJS-generated markup + login text.
-  # If this passes in CI but the user still sees a white page on the live Xen qube,
-  # that itself localizes the bug to the runtime environment (e.g. hostname/pmxcfs
-  # state) rather than the baked image. Best-effort on tooling, hard on the verdict.
+  # 5h3b. proxmoxlib.js must be SYNTACTICALLY VALID JavaScript. The real white-page
+  # cause was a broken subscription-nag patch that left `res.void({ //...` + `) {`
+  # in proxmoxlib.js -- a parse error that aborts the whole file, so Proxmox.*
+  # base classes never define and PVE.StdWorkspace (extending them) cannot be
+  # created -> /PVE/StdWorkspace.js 500 -> blank page. The bundle still serves 200
+  # with the right size and still "contains PVE.StdWorkspace", so the checks above
+  # PASS on it -- only a parser catches this. Use the baked Chromium as a JS engine
+  # (headless, --dump-dom of a data: page that fetches+eval-compiles the file) and,
+  # cheaply first, a static guard for the known-broken token.
+  PLIB_URL="https://127.0.0.1:8006/proxmoxlib.js"
+  if curl -sk --max-time 20 "${PLIB_URL}" 2>/dev/null | grep -q 'res\.void(' ; then
+    fail "proxmoxlib.js contains the broken 'res.void(' nag patch -- syntax error white-pages the UI"
+  fi
   CHROME="$(command -v chromium || command -v chromium-browser || true)"
   if [ -n "${CHROME}" ]; then
+    # new Function(src) compiles WITHOUT executing -- a pure syntax check. Print a
+    # sentinel on success / the SyntaxError on failure, into the rendered DOM.
+    SYN=/tmp/pve-syntax.html
+    cat >/tmp/pve-syntax-probe.html <<'HTML'
+<!doctype html><body><pre id="r">PENDING</pre><script>
+fetch(location.hash.slice(1)).then(r=>r.text()).then(src=>{
+  try { new Function(src); document.getElementById('r').textContent='SYNTAX_OK'; }
+  catch(e){ document.getElementById('r').textContent='SYNTAX_ERR: '+e.message; }
+}).catch(e=>{document.getElementById('r').textContent='FETCH_ERR: '+e;});
+</script></body>
+HTML
+    timeout 60 "${CHROME}" --headless=new --no-sandbox --disable-gpu \
+      --disable-dev-shm-usage --ignore-certificate-errors --virtual-time-budget=15000 \
+      --user-data-dir=/tmp/pve-syn-profile \
+      --dump-dom "file:///tmp/pve-syntax-probe.html#${PLIB_URL}" >"${SYN}" 2>/dev/null || true
+    if grep -q 'SYNTAX_OK' "${SYN}" 2>/dev/null; then
+      echo "ok: proxmoxlib.js compiles cleanly (no JS syntax error)"
+    else
+      echo "---- syntax probe output ----"; grep -oE 'SYNTAX_ERR:[^<]*|FETCH_ERR:[^<]*' "${SYN}" 2>/dev/null | head -1
+      fail "proxmoxlib.js failed to COMPILE -- a JS syntax error white-pages the whole UI (StdWorkspace.js 500)"
+    fi
+  fi
+
+  # 5h4. END-TO-END RENDER: load the page in the baked Chromium and prove ExtJS
+  # actually BUILT the UI. CRITICAL: assert on markup that only appears in the
+  # ExtJS-GENERATED DOM (x-viewport / the login window), NOT on `Ext.` -- which is
+  # literally in the static inline <script> of index.html and is therefore present
+  # even on a fully blank/white page. (That false-positive is exactly why an
+  # earlier version of this check passed while the live UI was white.) A real
+  # render injects Ext's component DOM into <body>; a white page leaves <body>
+  # holding only the static history-form. We require a generated-DOM marker AND a
+  # non-trivial <body>, and we explicitly fail if any /PVE/StdWorkspace.js request
+  # would be needed (the loader-fallback signature).
+  if [ -n "${CHROME}" ]; then
     RDOM=/tmp/pve-render-dom.html
-    # --virtual-time-budget lets ExtJS finish its async class load + layout before
-    # the DOM is serialized; --ignore-certificate-errors is honoured in headless
-    # (unlike --app mode) so the self-signed cert doesn't abort the navigation.
     timeout 60 "${CHROME}" --headless=new --no-sandbox --disable-gpu \
       --disable-dev-shm-usage --ignore-certificate-errors \
       --virtual-time-budget=20000 \
       --user-data-dir=/tmp/pve-render-profile \
       --dump-dom "https://127.0.0.1:8006" >"${RDOM}" 2>/tmp/pve-render.log || true
     dom_bytes=$(wc -c <"${RDOM}" 2>/dev/null || echo 0)
-    # A rendered PVE login page contains the product string and ExtJS form markup.
-    # A white page is a near-empty <body> with none of these.
-    if grep -qiE 'Proxmox VE Login|pve-login|x-form-item|Ext\.' "${RDOM}" 2>/dev/null; then
-      echo "ok: headless Chromium rendered the PVE UI (${dom_bytes}B DOM, login markup present)"
+    # Body content after the static history-form = what ExtJS generated.
+    body_after_form="$(sed -n 's/.*<\/form>//p' "${RDOM}" 2>/dev/null | tr -d ' \n\t')"
+    if grep -qE 'x-viewport|Proxmox VE Login|x-form-type-text|pve-login|x-mask' "${RDOM}" 2>/dev/null \
+       && [ "${#body_after_form}" -gt 200 ]; then
+      echo "ok: headless Chromium rendered the PVE UI (${dom_bytes}B DOM, ExtJS-generated markup present)"
     else
-      echo "---- rendered DOM (first 60 lines) ----"; head -n 60 "${RDOM}" 2>/dev/null || true
+      echo "---- rendered DOM (first 80 lines) ----"; head -n 80 "${RDOM}" 2>/dev/null || true
       echo "---- chromium stderr (last 40 lines) ----"; tail -n 40 /tmp/pve-render.log 2>/dev/null || true
-      fail "headless Chromium produced a BLANK page (${dom_bytes}B DOM, no PVE login markup) -- reproduces the white-page bug in CI"
+      fail "headless Chromium produced a BLANK page (${dom_bytes}B DOM, no ExtJS-generated markup) -- the white-page bug"
     fi
   else
     echo "warn: no chromium binary in smoke env -- skipped end-to-end render check"

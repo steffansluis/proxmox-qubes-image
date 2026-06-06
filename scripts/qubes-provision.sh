@@ -83,12 +83,29 @@ Suites: ${CODENAME}
 Components: pve-no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
-# Silence the "no valid subscription" login nag (cosmetic; guarded so an
-# upstream layout change can't break provisioning).
+# Silence the "no valid subscription" login nag (cosmetic). CRITICAL: the patch
+# must leave proxmoxlib.js as VALID JavaScript -- a syntax error here makes the
+# WHOLE file fail to parse, so the Proxmox.* base classes never define, PVE.Std
+# Workspace (which extends them) cannot instantiate, ExtJS falls back to GET
+# /PVE/StdWorkspace.js -> 500 -> BLANK WHITE PAGE. (That is exactly what the
+# previous patch did: it replaced the boolean CONDITION
+# `res.data.status.toLowerCase() !== 'active'` with `void({ //NoMoreNagging`,
+# leaving an unterminated `res.void({` + a line comment + `) {` -- invalid JS.)
+# The safe transform replaces the whole condition with the literal `false`, so
+# the nag branch is simply never taken and the file stays syntactically valid.
 PROXYLIB="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-if [ -f "$PROXYLIB" ] && ! grep -q "void({ //NoMoreNagging" "$PROXYLIB"; then
-  sed -i "s/data.status.toLowerCase() !== 'active'/void({ \/\/NoMoreNagging/" \
-    "$PROXYLIB" || true
+if [ -f "$PROXYLIB" ]; then
+  before="$(grep -c "status.toLowerCase() !== 'active'" "$PROXYLIB" 2>/dev/null || true)"
+  # Replace the exact boolean condition with `false` (valid JS). Both the login
+  # popup check and the dashboard subscriptionActive computation use this string.
+  sed -i "s/res\.data\.status\.toLowerCase() !== 'active'/false \/* NoMoreNagging *\//g" "$PROXYLIB"
+  after="$(grep -c "status.toLowerCase() !== 'active'" "$PROXYLIB" 2>/dev/null || true)"
+  echo "no-sub nag patch: neutralized $(( ${before:-0} - ${after:-0} )) subscription check(s) (valid-JS 'false')"
+  # Defence in depth: the broken form must NOT be present. Fail the bake if it is
+  # -- shipping it reintroduces the white page.
+  if grep -q "res.void(" "$PROXYLIB"; then
+    fail "proxmoxlib.js contains the broken 'res.void(' patch -- would white-page the UI"
+  fi
 fi
 
 # --- 1. Qubes R4.3 VM apt repository ---------------------------------------
@@ -739,8 +756,12 @@ CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 #  --password-store=basic / --disable-features=Translate   no keyring/extra D-Bus.
 #  --no-first-run / --no-default-browser-check   skip dialogs that swallow --app.
 #  --test-type         suppress the unsupported-flags infobar.
-# --ignore-certificate-errors is intentionally absent -- it's a no-op in --app
-# mode; the self-signed PVE cert still loads the UI fine.
+#  --ignore-certificate-errors   the PVE web UI uses a self-signed cert; without
+#                      this the user gets a NET::ERR_CERT_AUTHORITY_INVALID
+#                      interstitial in the --app window. (Earlier I wrongly called
+#                      this a no-op in --app mode and removed it; the user observed
+#                      it DOES suppress the warning -- restored. It does NOT mask
+#                      the white page, which was a JS syntax error, now fixed.)
 LAUNCHER=/usr/bin/proxmox-web-gui
 cat >"${LAUNCHER}" <<'EOF'
 #!/bin/sh
@@ -780,6 +801,7 @@ exec "${CHROMIUM}" --app="${URL}" --no-sandbox \
   --user-data-dir="${PROFILE}" \
   --disk-cache-dir="${CACHE}" --disk-cache-size=1 \
   --disable-gpu --disable-dev-shm-usage \
+  --ignore-certificate-errors \
   --password-store=basic --disable-features=Translate \
   --no-first-run --no-default-browser-check --test-type "$@"
 EOF
