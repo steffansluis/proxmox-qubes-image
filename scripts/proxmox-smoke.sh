@@ -313,6 +313,33 @@ else
     || fail "qubes-vmbr0-netcfg did not no-op cleanly when no IP is assigned"
   echo "ok: vmbr0 auto-net installed, Xen-gated (inactive here), generator validated"
 
+  # 5g2. WireGuard peer scaffolding: the image must ship wireguard-tools + a
+  # placeholder wg0.conf + first-boot keygen, but must NEVER bake a private key
+  # (public repo/image). And wg-quick@wg0 must be DISABLED (no server pubkey yet,
+  # so auto-up would fail-loop on every boot).
+  command -v wg >/dev/null 2>&1 || fail "wireguard-tools (wg) not installed in image"
+  if dpkg -l wireguard-dkms 2>/dev/null | grep -q '^ii'; then
+    fail "wireguard-dkms installed -- conflicts with the PVE built-in WG module"
+  fi
+  WGCONF=/etc/wireguard/wg0.conf
+  [ -f "${WGCONF}" ] || fail "missing ${WGCONF} (WireGuard peer config placeholder)"
+  grep -q '__WG_PRIVATE_KEY__' "${WGCONF}" \
+    || fail "${WGCONF} has no __WG_PRIVATE_KEY__ placeholder -- a private key may have been baked"
+  # The cardinal rule: NO secret in the published image.
+  [ -e /etc/wireguard/privatekey ] \
+    && fail "/etc/wireguard/privatekey exists in the image -- WG secret baked into a public artifact"
+  GENKEY=/etc/systemd/system/wg-genkey.service
+  [ -f "${GENKEY}" ] || fail "missing ${GENKEY} (first-boot WG keygen)"
+  [ "$(systemctl is-enabled wg-genkey.service 2>/dev/null)" = "enabled" ] \
+    || fail "wg-genkey.service not enabled -- image won't generate its WG keypair"
+  # wg-quick@wg0 must NOT be enabled (would fail-loop until peer is configured).
+  if [ "$(systemctl is-enabled wg-quick@wg0.service 2>/dev/null)" = "enabled" ]; then
+    fail "wg-quick@wg0 is enabled but the image ships no server peer -- it will fail-loop on boot"
+  fi
+  grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.d/99-wg-forward.conf 2>/dev/null \
+    || fail "missing ip_forward sysctl -- WG can't route LXC container traffic to the LAN"
+  echo "ok: WireGuard peer scaffolding present (no baked secret, keygen enabled, wg-quick disabled)"
+
   # 5h. The Proxmox identity is pinned against the Qubes agent's boot-time
   # rename. Under real Xen qubes-early-vm-config.sh renames the host to the qube
   # name unless /etc/hostname is a Qubes "protected file"; a renamed, unresolvable

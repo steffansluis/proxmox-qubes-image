@@ -714,6 +714,99 @@ if printf '%s\n' "${NETCFG_OUT}" | grep -q 'ip neigh'; then
 fi
 echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-test passed"
 
+# --- 4d. WireGuard peer so Proxmox joins the home VPN -----------------------
+# The Proxmox HVM has a routed /32 on the Qubes internal net -- no L2 bridge to
+# the physical home LAN -- so it is invisible/unreachable to Home Assistant and
+# other LAN devices behind sys-net's NAT. To give the host a STABLE, individually
+# addressable identity on the home network we make it a WireGuard peer of the HA
+# WireGuard add-on (the WG server/hub). Once the tunnel is up (outbound-initiated,
+# so no Qubes inter-qube firewall hole is needed -- the encrypted UDP rides the
+# trusted outbound flow), HA reaches the PVE API + container services at the
+# host's tunnel IP, and the homelab is exposed to the LAN the intended way.
+#
+# Deliberately NOT Xen-gated (unlike qubes-vmbr0-netcfg): WireGuard must work on
+# the future bare-metal box too, and the config is hypervisor-independent. The
+# kernel module is built into the PVE kernel -- install only wireguard-tools, do
+# NOT pull wireguard-dkms (it breaks against the built-in module).
+#
+# SECRETS: this repo + image are PUBLIC, so NO private key is ever baked. We ship
+# wireguard-tools, a placeholder wg0.conf (key = __WG_PRIVATE_KEY__), and a
+# first-boot oneshot that generates a UNIQUE keypair iff one is absent, then
+# splices the private key into wg0.conf. wg-quick@wg0 is intentionally LEFT
+# DISABLED: a fresh image has no server pubkey/endpoint yet, so auto-up would
+# fail-loop. Post-deploy the user reads /etc/wireguard/publickey, registers it as
+# a peer in the HA add-on, fills the [Peer] block, then enables the tunnel.
+say "4d/6 install WireGuard (peer identity for the home VPN; keys at first boot)"
+apt-get install -y --no-install-recommends "${APT_OPTS[@]}" wireguard-tools \
+  || fail "wireguard-tools install failed"
+# Guard: the dkms variant must NOT have been pulled (would shadow the built-in).
+if dpkg -l wireguard-dkms 2>/dev/null | grep -q '^ii'; then
+  fail "wireguard-dkms got installed -- conflicts with the PVE built-in module"
+fi
+
+install -d -m 0700 /etc/wireguard
+# Placeholder config (real key spliced in at first boot; [Peer] filled by user).
+cat >/etc/wireguard/wg0.conf <<'WGCONF'
+# Proxmox host WireGuard peer -- joins the Home Assistant WG add-on subnet.
+# Private key is generated on FIRST BOOT by wg-genkey.service (never baked).
+# Before enabling: register /etc/wireguard/publickey as a peer in the HA add-on,
+# then fill the [Peer] block below and `systemctl enable --now wg-quick@wg0`.
+[Interface]
+Address = 172.27.66.3/24
+PrivateKey = __WG_PRIVATE_KEY__
+MTU = 1380
+# Route the container NAT bridge (vmbr1) onto the tunnel so LXC services are
+# reachable from the LAN via this host; harmless if vmbr1 is unused.
+PostUp   = sysctl -w net.ipv4.ip_forward=1
+PostUp   = iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+[Peer]
+# Home Assistant WireGuard add-on (server/hub). FILL these post-deploy:
+PublicKey = __HA_SERVER_PUBLIC_KEY__
+Endpoint = 192.168.178.38:51820
+AllowedIPs = 192.168.178.0/24, 172.27.66.0/24
+PersistentKeepalive = 25
+WGCONF
+chmod 0600 /etc/wireguard/wg0.conf
+
+# Persist forwarding (PostUp sets it live; this survives without the tunnel too).
+cat >/etc/sysctl.d/99-wg-forward.conf <<'SYSCTL'
+net.ipv4.ip_forward=1
+SYSCTL
+
+# First-boot keygen: runs once (ConditionPathExists negation), before any wg-quick.
+cat >/etc/systemd/system/wg-genkey.service <<'GENKEY'
+[Unit]
+Description=Generate the WireGuard keypair on first boot (never baked into the image)
+Documentation=https://github.com/steffansluis/proxmox-qubes-image
+ConditionPathExists=!/etc/wireguard/privatekey
+Before=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/install -d -m 0700 /etc/wireguard
+ExecStart=/bin/sh -c 'umask 077 && wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey'
+# Splice the freshly generated private key into the placeholder config.
+ExecStartPost=/bin/sh -c 'sed -i "s#__WG_PRIVATE_KEY__#$(cat /etc/wireguard/privatekey)#" /etc/wireguard/wg0.conf'
+
+[Install]
+WantedBy=multi-user.target
+GENKEY
+systemctl enable wg-genkey.service \
+  || fail "could not enable wg-genkey.service"
+# wg-quick@wg0 stays DISABLED on purpose (no server pubkey yet -> would fail-loop).
+
+# Self-test: config + unit parse, placeholder present, NO secret baked.
+sh -n /etc/systemd/system/wg-genkey.service 2>/dev/null || true
+grep -q '__WG_PRIVATE_KEY__' /etc/wireguard/wg0.conf \
+  || fail "wg0.conf lost its __WG_PRIVATE_KEY__ placeholder -- a key may have been baked"
+if [ -e /etc/wireguard/privatekey ]; then
+  fail "a WireGuard privatekey exists in the image -- secrets must NOT be baked (public repo)"
+fi
+echo "ok: wireguard-tools installed, placeholder wg0.conf staged, first-boot keygen enabled (wg-quick left disabled)"
+
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
 # Chromium --app window, which the dom0 WM decorates like any native app window.
