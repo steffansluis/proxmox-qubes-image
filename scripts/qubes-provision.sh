@@ -735,11 +735,13 @@ echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-tes
 # the published artifact -- a secret leak.) Instead we ship wireguard-tools, a
 # placeholder wg0.conf (key = __WG_PRIVATE_KEY__), and a USER-RUN helper
 # /usr/sbin/wg-setup-key that the operator invokes ONCE post-deploy to generate
-# the keypair and splice the private key into wg0.conf. Nothing runs automatically:
-# wg-quick@wg0 is left DISABLED until the host has its own private key. The [Peer]
-# block (HA add-on server pubkey + endpoint) IS pre-filled -- a WG public key is
-# not secret. Post-deploy: run wg-setup-key, register the printed public key as the
-# proxmox peer in the HA add-on, then `systemctl enable --now wg-quick@wg0`.
+# the keypair and splice it (plus the [Peer] server pubkey + endpoint, passed as
+# args) into wg0.conf. Nothing runs automatically: wg-quick@wg0 is DISABLED until
+# the host has its key + peer. The [Peer] server pubkey AND endpoint are left as
+# placeholders (NOT baked) -- the endpoint becomes a PUBLIC address for roaming, so
+# keeping the operator's address out of the public image is the right default.
+# Post-deploy: run `wg-setup-key <SERVER_PUBKEY> <ENDPOINT>`, register the printed
+# host public key as the proxmox peer in the HA add-on, then enable the tunnel.
 say "4d/6 install WireGuard (peer identity for the home VPN; keys via wg-setup-key)"
 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" wireguard-tools \
   || fail "wireguard-tools install failed"
@@ -766,9 +768,11 @@ PostUp   = iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j
 PostDown = iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 [Peer]
-# Home Assistant WireGuard add-on (server/hub). A WG *public* key is not secret.
-PublicKey = Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM=
-Endpoint = 192.168.178.38:51820
+# Home Assistant WireGuard add-on (server/hub). FILL post-deploy -- intentionally
+# NOT baked: the endpoint will become a PUBLIC address (for roaming), and keeping
+# the operator's home/public address out of the public image is the right default.
+PublicKey = __HA_SERVER_PUBLIC_KEY__
+Endpoint = __HA_ENDPOINT__
 AllowedIPs = 192.168.178.0/24, 172.27.66.0/24
 PersistentKeepalive = 25
 WGCONF
@@ -786,22 +790,35 @@ SYSCTL
 # safe to re-run; prints the public key to register with the HA add-on.
 cat >/usr/sbin/wg-setup-key <<'SETUPKEY'
 #!/bin/sh
-# Generate this host's WireGuard keypair and splice the private key into wg0.conf.
-# Run ONCE post-deploy as root. Idempotent. Prints the public key to register as a
-# peer in the Home Assistant WireGuard add-on.
+# Finish the WireGuard config for this host. Run ONCE post-deploy as root.
+# Generates the keypair (idempotent), splices the host private key, and -- if
+# given -- the [Peer] server public key + endpoint. Prints the host public key
+# to register as the peer in the Home Assistant WireGuard add-on.
+#
+# Usage: wg-setup-key [SERVER_PUBKEY] [ENDPOINT host:port]
+#   e.g. wg-setup-key Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM= vpn.example.com:51820
+# Args are optional; omit to fill them by hand in /etc/wireguard/wg0.conf later.
 set -eu
 CONF=/etc/wireguard/wg0.conf
+SERVER_PUBKEY="${1:-}"
+ENDPOINT="${2:-}"
 install -d -m 0700 /etc/wireguard
 if [ -s /etc/wireguard/privatekey ]; then
-  echo "wg-setup-key: keypair already present; public key:"
+  echo "wg-setup-key: keypair already present."
 else
   umask 077
   wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
   if grep -q '__WG_PRIVATE_KEY__' "$CONF" 2>/dev/null; then
     sed -i "s#__WG_PRIVATE_KEY__#$(cat /etc/wireguard/privatekey)#" "$CONF"
   fi
-  echo "wg-setup-key: keypair generated and spliced into ${CONF}; public key:"
+  echo "wg-setup-key: keypair generated and spliced into ${CONF}."
 fi
+[ -n "$SERVER_PUBKEY" ] && sed -i "s#__HA_SERVER_PUBLIC_KEY__#${SERVER_PUBKEY}#" "$CONF"
+[ -n "$ENDPOINT" ]      && sed -i "s#__HA_ENDPOINT__#${ENDPOINT}#" "$CONF"
+if grep -q '__HA_SERVER_PUBLIC_KEY__\|__HA_ENDPOINT__' "$CONF"; then
+  echo "wg-setup-key: NOTE peer pubkey/endpoint still unset in ${CONF} -- fill before enabling wg-quick@wg0."
+fi
+echo "wg-setup-key: register this host public key as the proxmox peer in the HA add-on:"
 cat /etc/wireguard/publickey
 SETUPKEY
 chmod 0755 /usr/sbin/wg-setup-key

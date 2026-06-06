@@ -327,6 +327,10 @@ else
   [ -f "${WGCONF}" ] || fail "missing ${WGCONF} (WireGuard peer config placeholder)"
   grep -q '__WG_PRIVATE_KEY__' "${WGCONF}" \
     || fail "${WGCONF} has no __WG_PRIVATE_KEY__ placeholder -- a private key may have been baked"
+  # The peer endpoint becomes a PUBLIC address for roaming -- keep the operator's
+  # address out of the published image (filled post-deploy by wg-setup-key args).
+  grep -q '__HA_ENDPOINT__' "${WGCONF}" \
+    || fail "${WGCONF} has no __HA_ENDPOINT__ placeholder -- the operator's endpoint may have been baked"
   # The cardinal rule: NO secret/keys in the published image, not even auto-generated.
   [ -e /etc/wireguard/privatekey ] \
     && fail "/etc/wireguard/privatekey exists in the image -- WG secret baked into a public artifact"

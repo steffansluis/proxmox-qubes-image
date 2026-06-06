@@ -58,20 +58,40 @@ HA add-on peer config lives behind the Supervisor API; the LLAT is Core-scope.
      `addresses: [172.27.66.3]` ✅ added.
    - `proxmox` — `addresses: [172.27.66.4]` ✅ added, **pubkey still TODO**
      (run `wg-setup-key` on Proxmox after re-import, then paste the printed key).
-   - server public key `Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM=`, port 51820
-     ✅ given — `[Peer]` blocks now filled in both wg0.confs.
-2. **Fritz!Box** → static route `172.27.66.0/24` via `192.168.178.38` (user: in progress).
+   - server public key `Ca1v7+61kPvd955BlZ19Lx/XbtxWLNCIA8UfeKTEzTM=`, port 51820.
+     Deliberately NOT baked into the image (the image `[Peer]` keeps
+     `__HA_SERVER_PUBLIC_KEY__` + `__HA_ENDPOINT__` placeholders): the user plans
+     to switch the endpoint to a PUBLIC address so the tunnel works while roaming,
+     and the operator's address shouldn't ship in a public artifact. Both are
+     spliced post-deploy by `wg-setup-key <SERVER_PUBKEY> <ENDPOINT>`.
+2. **Router static route** (gateway `192.168.178.1`) → `172.27.66.0/24` via
+   `192.168.178.38`. NOTE: the router is NOT a Fritz!Box (serves a Vite/React SPA,
+   lighttpd) — model TBD; see "Router" below. Needed so LAN clients other than HA
+   can reach the tunnel subnet. NOT required for HA↔Proxmox itself (HA is the WG
+   hub, already knows the route).
 3. **AdGuard** → DNS rewrites `proxmox.home.arpa → 172.27.66.4` (+ services later).
 
 ## Sequence
 1. CI green on the WG image → rebuild/pull v8-wg, dom0 re-import (stream over qrexec).
-2. Proxmox post-boot: run `wg-setup-key` → it prints the public key; register that
-   as the `proxmox` peer's pubkey in the HA add-on (peer + IP already added).
-3. User completes Fritz route + AdGuard names (above; in progress).
-4. Fill peer blocks; `systemctl enable --now wg-quick@wg0` on Proxmox;
-   `wg-quick up /rw/config/wg0.conf` on personal when roaming.
-5. Verify HA→Proxmox (`172.27.66.4:8006`) and personal→Proxmox; then the
+2. Proxmox post-boot: `wg-setup-key <SERVER_PUBKEY> <ENDPOINT>` → generates the
+   host key, splices key+peer, prints the host public key. Register that as the
+   `proxmox` peer's pubkey in the HA add-on (peer + IP already added).
+3. `systemctl enable --now wg-quick@wg0` on Proxmox; `wg-quick up
+   /rw/config/wg0.conf` on personal when roaming.
+4. Verify HA→Proxmox (`172.27.66.4:8006`) and personal→Proxmox; then the
    container-automation trial via the Proxmox API (`proxmoxer`).
+5. (Optional, for other LAN clients) router static route + AdGuard names above.
+
+## Router (gateway 192.168.178.1)
+NOT a Fritz!Box — probed 2026-06-06: lighttpd/1.4.67 serving a Vite/React SPA
+(`/vite.svg`, `/index.js`, `<div id="root">`), empty `<title>`, no `tr64desc.xml`
+on :49000, `jason_boxinfo.xml` returns the SPA. Could be a custom/OpenWrt-LuCI-
+replacement UI, a pfSense/OPNsense-style box, or an ISP unit with a React UI.
+To add the static route the user needs to ID it (browse to http://192.168.178.1,
+check the login/brand) — then: pfSense/OPNsense → System ▸ Routing ▸ Static
+Routes; OpenWrt → Network ▸ Routing ▸ Static IPv4; generic → look for
+"Static routes"/"LAN routes". Destination `172.27.66.0/24`, gateway
+`192.168.178.38`. Only needed for LAN clients beyond HA.
 
 ## Notes
 - HA Proxmox *integration* is monitor + power-toggle only (can't create
