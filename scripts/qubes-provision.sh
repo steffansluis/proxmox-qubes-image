@@ -279,6 +279,32 @@ fi
 # /etc/hostname there makes the agent SKIP both the rename and the /etc/hosts
 # rewrite, keeping the runtime identity == the pmxcfs node == the bare `proxmox`
 # qube that already served the web UI fine. This is the Qubes-sanctioned hatch.
+# Re-enable cron. qubes-core-agent ships cron.service.d/30_qubes.conf gating it on
+# `ConditionPathExists=/var/run/qubes-service/crond` -- a flag file that only
+# appears when dom0 sets the `crond` qubes-service (via qubesdb, read by
+# qubes-sysinit). We deliberately omit the networking agent and don't want to
+# require a dom0 `qvm-service ... crond on` for the image to function, so the
+# condition is never met and cron SILENTLY never starts. Proxmox needs cron:
+# vzdump scheduled backups (/etc/pve/vzdump.cron), e2scrub, ZFS trim/scrub, plus
+# Debian's logrotate / apt-compat / man-db dailies. Clear the qubes condition
+# with a higher-priority drop-in (empty assignment resets the condition list, so
+# cron starts unconditionally as on a normal Debian host). Same reset idiom as
+# the random-seed ExecStartPre fix above.
+if systemctl cat cron.service >/dev/null 2>&1; then
+  d="/etc/systemd/system/cron.service.d"
+  install -d -m 0755 "${d}"
+  cat >"${d}/40-proxmox-force-cron.conf" <<'EOF'
+[Unit]
+# Baked by qubes-provision.sh. qubes-core-agent gates cron on a qubes-service
+# flag file (/var/run/qubes-service/crond) that never exists without the Qubes
+# networking agent / a dom0 qvm-service. Proxmox needs cron (vzdump backups,
+# e2scrub, ZFS maintenance, logrotate). Empty assignment clears that condition
+# so cron always starts, as on a normal Debian host.
+ConditionPathExists=
+EOF
+  echo "cleared the Qubes crond gate (cron will run for vzdump/logrotate/etc.)"
+fi
+
 PROTDIR=/etc/qubes/protected-files.d
 install -d -m 0755 "${PROTDIR}"
 cat >"${PROTDIR}/30-keep-proxmox-identity.conf" <<'EOF'

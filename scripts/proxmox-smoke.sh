@@ -312,6 +312,21 @@ else
       || fail "is_protected_file /etc/hostname is false -- Qubes agent would still rename host under Xen"
     echo "ok: /etc/hostname is a Qubes protected file (agent skips the rename under Xen)"
   fi
+  # 5h'. cron must actually run. qubes-core-agent gates cron.service on
+  # ConditionPathExists=/var/run/qubes-service/crond -- a flag that never exists
+  # in this image (no networking agent / dom0 qvm-service), so without our
+  # condition-clearing drop-in cron silently never starts, killing Proxmox vzdump
+  # backups, e2scrub, ZFS maintenance and Debian's logrotate/apt-compat/man-db.
+  # Under THIS QEMU boot the flag is likewise absent, so an un-fixed image would
+  # show cron inactive here -- making this a real regression guard.
+  CRONDROP=/etc/systemd/system/cron.service.d/40-proxmox-force-cron.conf
+  [ -f "${CRONDROP}" ] || fail "missing ${CRONDROP} -- cron would stay gated off by the Qubes crond condition"
+  if systemctl cat cron.service >/dev/null 2>&1; then
+    [ "$(systemctl is-active cron 2>/dev/null)" = "active" ] \
+      || fail "cron.service not active -- Qubes crond gate not cleared (vzdump/logrotate would never run)"
+    echo "ok: cron.service active (Qubes crond gate cleared)"
+  fi
+
   # The PVE cluster fs must be up and the web server must answer TLS on loopback.
   [ "$(systemctl is-active pve-cluster 2>/dev/null)" = "active" ] \
     || fail "pve-cluster (pmxcfs) not active -- /etc/pve won't mount, web UI cert missing"
