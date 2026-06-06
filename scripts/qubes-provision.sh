@@ -729,14 +729,17 @@ echo "ok: qubes-vmbr0-netcfg installed + enabled (Xen-gated), generator self-tes
 # kernel module is built into the PVE kernel -- install only wireguard-tools, do
 # NOT pull wireguard-dkms (it breaks against the built-in module).
 #
-# SECRETS: this repo + image are PUBLIC, so NO private key is ever baked. We ship
-# wireguard-tools, a placeholder wg0.conf (key = __WG_PRIVATE_KEY__), and a
-# first-boot oneshot that generates a UNIQUE keypair iff one is absent, then
-# splices the private key into wg0.conf. wg-quick@wg0 is intentionally LEFT
-# DISABLED: a fresh image has no server pubkey/endpoint yet, so auto-up would
-# fail-loop. Post-deploy the user reads /etc/wireguard/publickey, registers it as
-# a peer in the HA add-on, fills the [Peer] block, then enables the tunnel.
-say "4d/6 install WireGuard (peer identity for the home VPN; keys at first boot)"
+# SECRETS: this repo + image are PUBLIC, so NO private key is ever baked AND none
+# is auto-generated at boot. (CI boots the very qcow2 it then publishes during the
+# smoke test, so a first-boot keygen oneshot would splice a real private key into
+# the published artifact -- a secret leak.) Instead we ship wireguard-tools, a
+# placeholder wg0.conf (key = __WG_PRIVATE_KEY__), and a USER-RUN helper
+# /usr/sbin/wg-setup-key that the operator invokes ONCE post-deploy to generate
+# the keypair and splice the private key into wg0.conf. Nothing runs automatically:
+# wg-quick@wg0 is left DISABLED (a fresh image has no server pubkey/endpoint yet,
+# so auto-up would fail-loop). Post-deploy: run wg-setup-key, register the printed
+# public key as a peer in the HA add-on, fill the [Peer] block, enable the tunnel.
+say "4d/6 install WireGuard (peer identity for the home VPN; keys via wg-setup-key)"
 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" wireguard-tools \
   || fail "wireguard-tools install failed"
 # Guard: the dkms variant must NOT have been pulled (would shadow the built-in).
@@ -748,11 +751,11 @@ install -d -m 0700 /etc/wireguard
 # Placeholder config (real key spliced in at first boot; [Peer] filled by user).
 cat >/etc/wireguard/wg0.conf <<'WGCONF'
 # Proxmox host WireGuard peer -- joins the Home Assistant WG add-on subnet.
-# Private key is generated on FIRST BOOT by wg-genkey.service (never baked).
-# Before enabling: register /etc/wireguard/publickey as a peer in the HA add-on,
-# then fill the [Peer] block below and `systemctl enable --now wg-quick@wg0`.
+# Private key is generated post-deploy by `wg-setup-key` (never baked, never auto-run).
+# Before enabling: run /usr/sbin/wg-setup-key, register the printed public key as a
+# peer in the HA add-on, fill the [Peer] block below, `systemctl enable --now wg-quick@wg0`.
 [Interface]
-Address = 172.27.66.3/24
+Address = 172.27.66.4/24
 PrivateKey = __WG_PRIVATE_KEY__
 MTU = 1380
 # Route the container NAT bridge (vmbr1) onto the tunnel so LXC services are
@@ -775,37 +778,42 @@ cat >/etc/sysctl.d/99-wg-forward.conf <<'SYSCTL'
 net.ipv4.ip_forward=1
 SYSCTL
 
-# First-boot keygen: runs once (ConditionPathExists negation), before any wg-quick.
-cat >/etc/systemd/system/wg-genkey.service <<'GENKEY'
-[Unit]
-Description=Generate the WireGuard keypair on first boot (never baked into the image)
-Documentation=https://github.com/steffansluis/proxmox-qubes-image
-ConditionPathExists=!/etc/wireguard/privatekey
-Before=wg-quick@wg0.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/usr/bin/install -d -m 0700 /etc/wireguard
-ExecStart=/bin/sh -c 'umask 077 && wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey'
-# Splice the freshly generated private key into the placeholder config.
-ExecStartPost=/bin/sh -c 'sed -i "s#__WG_PRIVATE_KEY__#$(cat /etc/wireguard/privatekey)#" /etc/wireguard/wg0.conf'
-
-[Install]
-WantedBy=multi-user.target
-GENKEY
-systemctl enable wg-genkey.service \
-  || fail "could not enable wg-genkey.service"
+# User-run keygen helper (NOT a systemd unit -- nothing runs at boot, so CI's
+# smoke boot of the to-be-published qcow2 can never generate/leak a private key).
+# On /usr/sbin (immutable root), NOT /usr/local (qubes-core-agent bind-mounts
+# /usr/local from /rw/usrlocal, which would shadow a baked-in file). Idempotent:
+# safe to re-run; prints the public key to register with the HA add-on.
+cat >/usr/sbin/wg-setup-key <<'SETUPKEY'
+#!/bin/sh
+# Generate this host's WireGuard keypair and splice the private key into wg0.conf.
+# Run ONCE post-deploy as root. Idempotent. Prints the public key to register as a
+# peer in the Home Assistant WireGuard add-on.
+set -eu
+CONF=/etc/wireguard/wg0.conf
+install -d -m 0700 /etc/wireguard
+if [ -s /etc/wireguard/privatekey ]; then
+  echo "wg-setup-key: keypair already present; public key:"
+else
+  umask 077
+  wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+  if grep -q '__WG_PRIVATE_KEY__' "$CONF" 2>/dev/null; then
+    sed -i "s#__WG_PRIVATE_KEY__#$(cat /etc/wireguard/privatekey)#" "$CONF"
+  fi
+  echo "wg-setup-key: keypair generated and spliced into ${CONF}; public key:"
+fi
+cat /etc/wireguard/publickey
+SETUPKEY
+chmod 0755 /usr/sbin/wg-setup-key
 # wg-quick@wg0 stays DISABLED on purpose (no server pubkey yet -> would fail-loop).
 
-# Self-test: config + unit parse, placeholder present, NO secret baked.
-sh -n /etc/systemd/system/wg-genkey.service 2>/dev/null || true
+# Self-test: config parses, helper parses, placeholder present, NO secret/keys baked.
+sh -n /usr/sbin/wg-setup-key || fail "wg-setup-key has a syntax error"
 grep -q '__WG_PRIVATE_KEY__' /etc/wireguard/wg0.conf \
   || fail "wg0.conf lost its __WG_PRIVATE_KEY__ placeholder -- a key may have been baked"
-if [ -e /etc/wireguard/privatekey ]; then
-  fail "a WireGuard privatekey exists in the image -- secrets must NOT be baked (public repo)"
+if [ -e /etc/wireguard/privatekey ] || [ -e /etc/wireguard/publickey ]; then
+  fail "a WireGuard key exists in the image -- secrets must NOT be baked (public repo)"
 fi
-echo "ok: wireguard-tools installed, placeholder wg0.conf staged, first-boot keygen enabled (wg-quick left disabled)"
+echo "ok: wireguard-tools installed, placeholder wg0.conf staged, wg-setup-key helper shipped (no auto-keygen, wg-quick disabled)"
 
 # --- 5. A browser to render the web UI, + the app-menu shortcut -------------
 # The "Proxmox Web GUI" menu entry opens the local web interface in a chromeless
