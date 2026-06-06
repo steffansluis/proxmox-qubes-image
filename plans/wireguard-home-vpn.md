@@ -102,8 +102,9 @@ LG/Compal **Ziggo Connect Box / SmartWifi modem** (RDK-B). The probe earlier
    the user confirmed 2026-06-07 that a port-forward of UDP 51820 → HA already
    works from OUTSIDE the home network. So this line is NOT on CGNAT (public IPv4,
    or Ziggo moved them to IPv4-only). The ROAMING endpoint (`__HA_ENDPOINT__`) is
-   therefore just `<home-public-IPv4-or-DDNS>:51820` — no IPv6/VPS-relay needed.
-   A DDNS name is still wise (Ziggo IPv4 can change); the port-forward stays.
+   therefore just `<DDNS-name>:51820` — no IPv6/VPS-relay needed. The user already
+   runs DDNS and that name IS the roaming endpoint (handles Ziggo IPv4 changes);
+   the modem port-forward stays. So `__HA_ENDPOINT__` = `<user-DDNS-name>:51820`.
 
 To open the modem: http://192.168.178.1, password on the sticker; advanced
 settings live under "SmartWifi web" (port-forward, DHCP) — confirm there's truly
