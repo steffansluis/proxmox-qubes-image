@@ -355,7 +355,23 @@ QUBES_GRUB_DROPIN=/etc/default/grub.d/30-qubes.cfg
 if [ -e "${QUBES_GRUB_DROPIN}" ]; then
   rm -f "${QUBES_GRUB_DROPIN}" && echo "removed Qubes grub override ${QUBES_GRUB_DROPIN} (forced root=dmroot)"
 fi
-SERIAL_ARGS="console=tty0 console=ttyS0,115200"
+# THE Xen-vs-QEMU NIC-NAME FIX (found by mounting the built image; run 27063433922
+# shipped the bug). Proxmox bakes `bridge-ports enp0s2` into /etc/network/interfaces
+# -- `enp0s2` is the predictable name of the NIC AS ENUMERATED UNDER QEMU at install
+# time. The SAME image under a Xen HVM names that NIC `enX0` (systemd >=250 derives
+# a predictable name from the Xen netfront device, a different bus path). So on a
+# real Qubes StandaloneVM `enp0s2` does not exist -> it never enslaves to vmbr0 ->
+# the bridge has NO uplink -> 100% packet loss (enX0 down, vmbr0 portless). This is
+# INVISIBLE to CI: under QEMU the NIC really IS enp0s2, so vmbr0 + the NAT-out smoke
+# pass. FIX: disable predictable naming (`net.ifnames=0 biosdevname=0`) so the NIC
+# is kernel-native `eth0` on BOTH hypervisors, then rewrite bridge-ports to eth0
+# (below). net.ifnames=0 disables systemd's NamePolicy= for all classes, yielding
+# eth0 under QEMU (e1000/virtio) AND Xen (xen-netfront) alike. Single-NIC guest, so
+# eth0's multi-NIC ordering caveat doesn't apply. Once both converge on eth0, CI's
+# existing vmbr0 NAT-out smoke becomes a REAL regression guard for this very bug.
+SERIAL_ARGS="net.ifnames=0 biosdevname=0 console=tty0 console=ttyS0,115200"
+# Idempotency below keys on this marker; it must be in SERIAL_ARGS.
+CMDLINE_MARKER="net.ifnames=0"
 refreshed=""
 # Proxmox boots EITHER via systemd-boot/proxmox-boot-tool (cmdline lives in
 # /etc/kernel/cmdline) OR via classic grub (GRUB_CMDLINE_LINUX_DEFAULT in
@@ -368,7 +384,7 @@ KCMDLINE=/etc/kernel/cmdline
 if command -v proxmox-boot-tool >/dev/null 2>&1 \
    && proxmox-boot-tool status >/dev/null 2>&1; then
   if [ -f "${KCMDLINE}" ]; then
-    if ! grep -q 'console=ttyS0' "${KCMDLINE}"; then
+    if ! grep -q "${CMDLINE_MARKER}" "${KCMDLINE}"; then
       # Single-line file: append the args to the end of the (only) line.
       sed -i "1 s|\$| ${SERIAL_ARGS}|" "${KCMDLINE}"
     fi
@@ -383,7 +399,7 @@ fi
 # --- classic grub path ------------------------------------------------------
 GRUBDEF=/etc/default/grub
 if [ -z "${refreshed}" ] && [ -f "${GRUBDEF}" ]; then
-  if ! grep -q 'console=ttyS0' "${GRUBDEF}"; then
+  if ! grep -q "${CMDLINE_MARKER}" "${GRUBDEF}"; then
     # Append to GRUB_CMDLINE_LINUX_DEFAULT, preserving any existing value.
     if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "${GRUBDEF}"; then
       sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 ${SERIAL_ARGS}\"/" \
@@ -411,6 +427,38 @@ for cfg in /boot/grub/grub.cfg /boot/efi/EFI/proxmox/*/grub.cfg /etc/kernel/cmdl
   fi
 done
 echo "ok: boot config targets pve-root (no stray root=dmroot)"
+
+# Companion to the net.ifnames=0 cmdline above: rewrite the installer's hardcoded
+# `bridge-ports enp0s2` (and the matching `iface enp0s2`) to `eth0`, which is what
+# the NIC is called once predictable naming is off -- on BOTH QEMU and Xen. Without
+# this the bridge would reference a now-nonexistent enp0s2 and STILL have no uplink.
+# Match the NIC token generically (en* / eth* / ens* / enp*) so we're robust to the
+# exact build-time name, but only touch the uplink lines, never vmbr*/lo.
+IFACES=/etc/network/interfaces
+if [ -f "${IFACES}" ]; then
+  # bridge-ports <nic>  ->  bridge-ports eth0
+  sed -i -E 's/^([[:space:]]*bridge-ports[[:space:]]+)(eth|en|ens|enp|enX)[A-Za-z0-9]*/\1eth0/' "${IFACES}"
+  # iface <nic> inet ...  ->  iface eth0 inet ...   (the standalone uplink stanza)
+  sed -i -E 's/^(iface[[:space:]]+)(enp|ens|enX|en|eth)[A-Za-z0-9]+([[:space:]]+inet)/\1eth0\3/' "${IFACES}"
+  # allow-hotplug/auto <nic> -> eth0 (if the installer emitted one)
+  sed -i -E 's/^((allow-hotplug|auto)[[:space:]]+)(enp|ens|enX|en|eth)[A-Za-z0-9]+$/\1eth0/' "${IFACES}"
+  echo "rewrote uplink NIC name to eth0 in ${IFACES}:"
+  grep -E 'bridge-ports|iface (eth|en)' "${IFACES}" | sed 's/^/    /'
+fi
+# A stale 70-persistent-net.rules would re-pin a name and defeat net.ifnames=0.
+rm -f /etc/udev/rules.d/70-persistent-net.rules 2>/dev/null || true
+# Tripwire: the bridge uplink MUST now be eth0, and NO enp*/enX* token may remain
+# as a bridge-port or uplink iface (that's exactly the bug that broke connectivity).
+if [ -f "${IFACES}" ]; then
+  grep -Eq '^[[:space:]]*bridge-ports[[:space:]]+eth0([[:space:]]|$)' "${IFACES}" \
+    || fail "interfaces does not set 'bridge-ports eth0' after rewrite -- uplink would be missing under Xen"
+  if grep -Eq '^[[:space:]]*bridge-ports[[:space:]]+(enp|ens|enX|en[0-9])' "${IFACES}"; then
+    fail "interfaces still has a predictable-named bridge-port -- would have no uplink under Xen (enX0)"
+  fi
+  echo "ok: vmbr0 bridge-ports is eth0 (works under both QEMU and Xen netfront)"
+fi
+# Rebuild initramfs so net.ifnames=0 is honored consistently from early boot.
+update-initramfs -u -k all >/dev/null 2>&1 || true
 
 # --- 4c. Qubes auto-networking for vmbr0 (QubesDB-driven) -------------------
 # Goal: the qube auto-configures its IP/gateway/DNS like any other Qubes VM,

@@ -72,6 +72,20 @@ pvesh get /version --output-format json || fail "pvesh API unreachable"
 # subnet out through vmbr0. This is the seam that lets many containers share
 # one flat network and one controlled exit, instead of per-service plumbing.
 say "2/5 internal NAT bridge vmbr1"
+# FIRST: the vmbr0 uplink must actually exist and be enslaved. The image hardcodes
+# `bridge-ports eth0` (after the net.ifnames=0 fix); if that NIC name is wrong for
+# the hypervisor, vmbr0 has NO port -> no uplink -> total connectivity loss (the
+# enp0s2-vs-enX0 bug that broke the real Qubes qube while CI stayed green). Assert
+# vmbr0 has at least one real (non-virtual) enslaved port AND that eth0 is present.
+say "2a/5 vmbr0 has a real enslaved uplink (eth0)"
+BRIF="$(ls /sys/class/net/vmbr0/brif/ 2>/dev/null || true)"
+[ -n "${BRIF}" ] || fail "vmbr0 has NO bridge ports -- uplink missing (bridge-ports name wrong for this hypervisor?)"
+echo "vmbr0 ports: ${BRIF}"
+ls /sys/class/net/eth0 >/dev/null 2>&1 \
+  || fail "no eth0 present -- net.ifnames=0 did not take effect; bridge-ports eth0 would be dangling"
+ls /sys/class/net/vmbr0/brif/eth0 >/dev/null 2>&1 \
+  || fail "eth0 exists but is NOT enslaved to vmbr0 -- uplink not bridged"
+echo "ok: eth0 enslaved to vmbr0 (uplink present)"
 # Snapshot interfaces before touching it so the EXIT trap can restore exactly.
 IFACES_BAK="$(mktemp)"
 cp -a "${IFACES}" "${IFACES_BAK}"
