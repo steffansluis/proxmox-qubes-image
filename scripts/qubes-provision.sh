@@ -263,6 +263,46 @@ EOF
   echo "made qubes-random-seed ExecStartPre non-fatal (unblocks sysinit.target off-Xen)"
 fi
 
+# Protect /etc/hostname from the Qubes agent's boot-time rename. Under real Xen
+# qubes-early-vm-config.sh does `if ! is_protected_file /etc/hostname; then
+# hostname "$(qubesdb-read /name)"; sed ... /etc/hosts; fi` -- renaming the host
+# to the QUBE name (e.g. proxmox-test). But Proxmox's pmxcfs baked its node
+# identity + the ONLY pve-ssl.pem into /var/lib/pve-cluster/config.db under the
+# INSTALL hostname `proxmox`. A renamed, unresolvable hostname makes pmxcfs
+# (pve-cluster.service) refuse to start -> /etc/pve never mounts -> pveproxy has
+# no TLS cert -> the web UI's TLS handshake blackholes (curl 000 / ERR_TIMED_OUT)
+# and pve-firewall/guests/ha-*/scheduler/statd all cascade-fail. INVISIBLE TO CI:
+# under QEMU there is no qubesdb /name, the rename never fires, the host stays
+# `proxmox`, and pmxcfs is healthy -- a Xen-only failure, like the NIC-name bug.
+# is_protected_file (/usr/lib/qubes/init/functions) returns true for any file in
+# /etc/qubes/protected-files.d containing a whole line == the path. Listing
+# /etc/hostname there makes the agent SKIP both the rename and the /etc/hosts
+# rewrite, keeping the runtime identity == the pmxcfs node == the bare `proxmox`
+# qube that already served the web UI fine. This is the Qubes-sanctioned hatch.
+PROTDIR=/etc/qubes/protected-files.d
+install -d -m 0755 "${PROTDIR}"
+cat >"${PROTDIR}/30-keep-proxmox-identity.conf" <<'EOF'
+# Baked by qubes-provision.sh. Keep Proxmox's installed hostname so pmxcfs
+# (pve-cluster) can resolve its node name and mount /etc/pve under real Xen.
+# Without this the Qubes agent renames the host to the qube name at boot and the
+# whole PVE web stack (cluster -> cert -> pveproxy) fails. See protected-files
+# mechanism in /usr/lib/qubes/init/functions (is_protected_file).
+/etc/hostname
+EOF
+# Self-test: source the Qubes helper and assert is_protected_file now agrees, so
+# we know the agent WILL skip the rename -- catches a path/format mismatch (e.g.
+# trailing slash, wrong dir) at bake time instead of on a live Xen boot.
+QFUNCS=/usr/lib/qubes/init/functions
+if [ -r "${QFUNCS}" ]; then
+  if ( . "${QFUNCS}"; is_protected_file /etc/hostname ); then
+    echo "ok: /etc/hostname is now a Qubes protected file (agent will not rename host)"
+  else
+    fail "is_protected_file /etc/hostname returned false -- the Qubes agent would still rename the host under Xen and break pmxcfs/pveproxy"
+  fi
+else
+  echo "warn: ${QFUNCS} absent (qubes-core-agent layout changed?); protected-files conf written but unverified"
+fi
+
 # --- 4. Keep the initramfs able to mount the virtio root --------------------
 # qubes-kernel-vm-support drops /usr/share/initramfs-tools/conf.d/qubes.conf
 # with `MODULES=dep` (overriding Debian's `MODULES=most`) + a hook that

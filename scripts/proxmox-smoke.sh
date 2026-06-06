@@ -290,6 +290,40 @@ else
     | grep -q 'no /qubes-ip' \
     || fail "qubes-vmbr0-netcfg did not no-op cleanly when no IP is assigned"
   echo "ok: vmbr0 auto-net installed, Xen-gated (inactive here), generator validated"
+
+  # 5h. The Proxmox identity is pinned against the Qubes agent's boot-time
+  # rename. Under real Xen qubes-early-vm-config.sh renames the host to the qube
+  # name unless /etc/hostname is a Qubes "protected file"; a renamed, unresolvable
+  # hostname makes pmxcfs (pve-cluster) refuse to start -> /etc/pve unmounted ->
+  # pveproxy has no TLS cert -> the web UI blackholes (curl 000 / ERR_TIMED_OUT),
+  # with pve-firewall/guests/ha-*/scheduler/statd all cascading. We can't trigger
+  # the rename under QEMU (no qubesdb /name), so assert (i) the protected-files
+  # entry exists and the Qubes helper agrees it protects /etc/hostname -- proving
+  # the agent WILL skip the rename under Xen -- and (ii) the PVE web stack is
+  # actually healthy on THIS (un-renamed) boot, a baseline regression guard for
+  # the whole pmxcfs -> cert -> pveproxy path.
+  PROTCONF=/etc/qubes/protected-files.d/30-keep-proxmox-identity.conf
+  [ -f "${PROTCONF}" ] || fail "missing ${PROTCONF} -- host would be renamed under Xen, breaking pmxcfs"
+  grep -Fxq '/etc/hostname' "${PROTCONF}" \
+    || fail "${PROTCONF} does not list /etc/hostname exactly -- protection won't match"
+  QFUNCS=/usr/lib/qubes/init/functions
+  if [ -r "${QFUNCS}" ]; then
+    ( . "${QFUNCS}"; is_protected_file /etc/hostname ) \
+      || fail "is_protected_file /etc/hostname is false -- Qubes agent would still rename host under Xen"
+    echo "ok: /etc/hostname is a Qubes protected file (agent skips the rename under Xen)"
+  fi
+  # The PVE cluster fs must be up and the web server must answer TLS on loopback.
+  [ "$(systemctl is-active pve-cluster 2>/dev/null)" = "active" ] \
+    || fail "pve-cluster (pmxcfs) not active -- /etc/pve won't mount, web UI cert missing"
+  HTTP_CODE="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' https://127.0.0.1:8006 2>/dev/null || true)"
+  case "${HTTP_CODE}" in
+    200|401)
+      echo "ok: pveproxy answers TLS on 127.0.0.1:8006 (HTTP ${HTTP_CODE}); web UI reachable" ;;
+    000|"")
+      fail "pveproxy TLS handshake blackholed on 127.0.0.1:8006 (curl=${HTTP_CODE:-empty}) -- this is the ERR_TIMED_OUT failure" ;;
+    *)
+      echo "ok: pveproxy answers on 127.0.0.1:8006 (HTTP ${HTTP_CODE})" ;;
+  esac
 fi
 
 # Teardown is handled by the EXIT trap (cleanup) so it runs on pass, fail, or
