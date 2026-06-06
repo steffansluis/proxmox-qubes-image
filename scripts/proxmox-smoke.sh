@@ -348,6 +348,13 @@ else
       || fail "cron.service not active -- Qubes crond gate not cleared (vzdump/logrotate would never run)"
     echo "ok: cron.service active (Qubes crond gate cleared)"
   fi
+  # anacron shares the same crond gate but is timer-driven (is-active is unreliable),
+  # so assert its gate-clearing drop-in exists instead.
+  if systemctl cat anacron.service >/dev/null 2>&1; then
+    [ -f /etc/systemd/system/anacron.service.d/40-proxmox-force-anacron.conf ] \
+      || fail "missing anacron crond-gate drop-in -- anacron stays gated off"
+    echo "ok: anacron crond gate cleared (drop-in present)"
+  fi
 
   # 5h''. SELF-DISCOVERING qubes-service-gate audit. cron was found reactively;
   # this generalizes it so an UNKNOWN gate on a Proxmox-needed service fails CI
@@ -361,16 +368,23 @@ else
   # Proxmox needs these running regardless of any Qubes flag. Time sync is covered
   # separately (chrony.service drop-in is empty + qubes-sync-time.timer); included
   # here only if a gate is detected on it.
-  MUSTRUN=" cron anacron postfix rsyslog ssh sshd pveproxy pvedaemon pve-cluster "
+  # anacron is intentionally NOT here: it's timer-triggered and exits, so is-active
+  # is an unreliable signal -- its gate-clearing drop-in is asserted separately below.
+  MUSTRUN=" cron postfix rsyslog ssh sshd pveproxy pvedaemon pve-cluster "
   gate_audit_ok=1
-  for ddir in /usr/lib/systemd/system/*.d /lib/systemd/system/*.d /etc/systemd/system/*.d; do
+  seen=" "   # dedupe: /lib is usually a symlink to /usr/lib -> same unit twice
+  # -L so the symlinked tree is walked once; we dedupe by unit name anyway.
+  for ddir in /usr/lib/systemd/system/*.d /etc/systemd/system/*.d; do
     [ -d "${ddir}" ] || continue
     # Does any drop-in here gate on a qubes-service flag?
     if grep -rslq 'ConditionPathExists=.*qubes-service' "${ddir}" 2>/dev/null; then
       unit="$(basename "${ddir}" .d)"
+      case "${seen}" in *" ${unit} "*) continue ;; esac
+      seen="${seen}${unit} "
       flag="$(grep -rho 'ConditionPathExists=[!|]*/\(var/\)\?run/qubes-service/[^ ]*' "${ddir}" 2>/dev/null \
               | head -n1 | sed 's#.*/qubes-service/##')"
-      base="${unit%@*}"   # normalize templated units (getty@.service -> getty)
+      base="${unit%.*}"   # strip .service/.socket/.path
+      base="${base%@*}"   # normalize templated units (getty@.service -> getty)
       case " ${MUSTRUN} " in
         *" ${base} "*)
           if systemctl cat "${unit}" >/dev/null 2>&1; then
